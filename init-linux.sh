@@ -50,6 +50,21 @@ run() {
   fi
 }
 
+prompt_input() {
+  local prompt="$1"
+  local result
+
+  if [[ -r /dev/tty ]]; then
+    read -r -p "${prompt}" result </dev/tty
+  elif [[ -t 0 ]]; then
+    read -r -p "${prompt}" result
+  else
+    result=""
+  fi
+
+  printf '%s' "${result}"
+}
+
 recommended_swap_size() {
   local mem_mb="$1"
 
@@ -100,11 +115,11 @@ should_run_step() {
   local name="$1"
   local answer
 
-  if [[ ! -t 0 ]]; then
+  if [[ ! -r /dev/tty && ! -t 0 ]]; then
     return 0
   fi
 
-  read -r -p "[${name}] 默认执行，输入 n 跳过，按回车继续：[Y/n] " answer
+  answer=$(prompt_input "[${name}] 默认执行，输入 n 跳过，按回车继续：[Y/n] ")
   [[ ! "${answer}" =~ ^[Nn]$ ]]
 }
 
@@ -282,16 +297,16 @@ fi
 if should_run_step "SSH"; then
   info "[SSH] 即将开始。"
 
-  if [[ ! -t 0 ]]; then
+  if [[ ! -r /dev/tty && ! -t 0 ]]; then
     warn "[SSH] 当前不是交互终端，已跳过 SSH 配置。"
   else
     echo
-    read -r -p "[SSH] 请输入要写入的 SSH 公钥（直接回车跳过）：" SSH_PUBLIC_KEY
+    SSH_PUBLIC_KEY=$(prompt_input "[SSH] 请输入要写入的 SSH 公钥（直接回车跳过）：")
 
     if [[ -z "${SSH_PUBLIC_KEY}" ]]; then
       info "[SSH] 未输入公钥，已跳过 SSH 配置。"
     else
-      read -r -p "[SSH] 请输入 SSH 端口（直接回车保持当前配置不变）：" SSH_PORT
+      SSH_PORT=$(prompt_input "[SSH] 请输入 SSH 端口（直接回车保持当前配置不变）：")
 
       if [[ -n "${SSH_PORT}" ]]; then
         [[ "${SSH_PORT}" =~ ^[0-9]+$ ]] || die "[SSH] SSH 端口必须是数字。"
@@ -316,7 +331,7 @@ if should_run_step "SSH"; then
         fi
       fi
 
-      read -r -p "[SSH] 已写入公钥，准备关闭密码登录并应用 SSH 配置，是否继续？[y/N] " SSH_CONFIRM
+      SSH_CONFIRM=$(prompt_input "[SSH] 已写入公钥，准备关闭密码登录并应用 SSH 配置，是否继续？[y/N] ")
       if [[ ! "${SSH_CONFIRM}" =~ ^[Yy]$ ]]; then
         warn "[SSH] 已取消修改 sshd_config，仅保留公钥写入。"
       else

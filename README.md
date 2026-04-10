@@ -23,16 +23,17 @@
 ## 快速开始
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | bash
+command -v curl >/dev/null || apt-get install -y -qq curl
+curl -fsSL https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | bash
 ```
 
 <details>
 <summary>其他运行方式</summary>
 
-使用 `curl`：
+使用 `wget`：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | bash
+wget -qO- https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | bash
 ```
 
 下载到本地后执行：
