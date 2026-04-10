@@ -23,12 +23,18 @@
 ## 快速开始
 
 ```bash
-command -v curl >/dev/null || apt-get install -y -qq curl
 curl -fsSL https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | bash
 ```
 
 <details>
 <summary>其他运行方式</summary>
+
+使用 `curl`（未安装时会自动安装）：
+
+```bash
+command -v curl >/dev/null || apt-get install -y -qq curl
+curl -fsSL https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | bash
+```
 
 使用 `wget`：
 
