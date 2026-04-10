@@ -156,7 +156,9 @@ if should_run_step "系统更新"; then
   run apt update
 
   info "[系统更新] 正在升级系统软件包..."
-  run apt upgrade -y
+  run env DEBIAN_FRONTEND=noninteractive apt upgrade -y \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold"
 
   echo
   ok "[系统更新] 执行完成：软件源已更新，系统已升级。"
