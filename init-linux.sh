@@ -50,6 +50,37 @@ run() {
   fi
 }
 
+ensure_download_tool() {
+  local context="$1"
+
+  if command -v curl &>/dev/null || command -v wget &>/dev/null; then
+    return 0
+  fi
+
+  info "[${context}] 未找到 curl/wget，正在安装 curl..."
+  run apt-get update -qq
+  run env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates curl
+
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    return 0
+  fi
+
+  command -v curl &>/dev/null || command -v wget &>/dev/null \
+    || die "[${context}] 无法找到 curl/wget，也未能自动安装 curl。"
+}
+
+download_to_stdout() {
+  local url="$1"
+
+  if command -v curl &>/dev/null; then
+    curl -fsSL "${url}"
+  elif command -v wget &>/dev/null; then
+    wget -qO- "${url}"
+  else
+    return 127
+  fi
+}
+
 prompt_input() {
   local prompt="$1"
   local result
@@ -399,11 +430,14 @@ fi
 if should_run_step "Docker"; then
   info "[Docker] 即将开始。"
   info "[Docker] 正在调用远程安装脚本..."
+  DOCKER_INSTALL_URL="https://raw.githubusercontent.com/Unarmored7/install-docker/main/install-docker.sh"
 
   if [[ "${DRY_RUN}" == "1" ]]; then
-    echo "${YELLOW}[DRY_RUN]${RESET} wget -qO- https://raw.githubusercontent.com/Unarmored7/install-docker/main/install-docker.sh | bash"
+    echo "${YELLOW}[DRY_RUN]${RESET} ensure curl/wget, install curl if both are missing"
+    echo "${YELLOW}[DRY_RUN]${RESET} curl -fsSL ${DOCKER_INSTALL_URL} | bash  # fallback: wget -qO-"
   else
-    wget -qO- https://raw.githubusercontent.com/Unarmored7/install-docker/main/install-docker.sh | bash
+    ensure_download_tool "Docker"
+    download_to_stdout "${DOCKER_INSTALL_URL}" | bash
   fi
 
   echo

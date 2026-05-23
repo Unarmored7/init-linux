@@ -23,16 +23,22 @@
 ## 快速开始
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | bash
+if command -v curl >/dev/null 2>&1; then
+  curl -fsSL https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | bash
+elif command -v wget >/dev/null 2>&1; then
+  wget -qO- https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | bash
+else
+  apt-get update -qq && apt-get install -y -qq ca-certificates curl
+  curl -fsSL https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | bash
+fi
 ```
 
 <details>
 <summary>其他运行方式</summary>
 
-使用 `curl`（未安装时会自动安装）：
+使用 `curl`：
 
 ```bash
-command -v curl >/dev/null || apt-get install -y -qq curl
 curl -fsSL https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | bash
 ```
 
@@ -138,10 +144,10 @@ apt upgrade -y
 
 ### 5. Docker
 
-直接调用以下远程脚本：
+直接调用 `install-docker` 远程脚本。脚本会优先使用 `curl`，没有 `curl` 时回退到 `wget`，两者都不存在时先通过 `apt-get` 安装 `curl`：
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/Unarmored7/install-docker/main/install-docker.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Unarmored7/install-docker/main/install-docker.sh | bash
 ```
 
 ---
