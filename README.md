@@ -22,25 +22,20 @@
 
 ## 快速开始
 
-```bash
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | bash
-elif command -v wget >/dev/null 2>&1; then
-  wget -qO- https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | bash
-else
-  apt-get update -qq && apt-get install -y -qq ca-certificates curl
-  curl -fsSL https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | bash
-fi
-```
-
-<details>
-<summary>其他运行方式</summary>
-
-使用 `curl`：
+以 `root` 用户执行：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | bash
 ```
+
+非 `root` 用户执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | sudo bash
+```
+
+<details>
+<summary>其他运行方式</summary>
 
 使用 `wget`：
 
@@ -48,13 +43,21 @@ curl -fsSL https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-lin
 wget -qO- https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | bash
 ```
 
-下载到本地后执行：
+先下载、检查，再执行：
 
 ```bash
+curl -fLO https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh
+less init-linux.sh
 bash init-linux.sh
 ```
 
-> **Note:** 非 root 用户执行时，请使用 `sudo bash`。
+系统没有 `curl` 或 `wget` 时，先安装 `curl`：
+
+```bash
+apt-get update && apt-get install -y ca-certificates curl
+```
+
+> **Note:** 使用其他方式时，非 `root` 用户请将 `bash` 替换为 `sudo bash`，并在需要时为 `apt-get` 加上 `sudo`。
 
 </details>
 
