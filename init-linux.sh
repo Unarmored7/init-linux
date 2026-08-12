@@ -69,15 +69,47 @@ ensure_download_tool() {
     || die "[${context}] 无法找到 curl/wget，也未能自动安装 curl。"
 }
 
-download_to_stdout() {
+download_to_file() {
   local url="$1"
+  local output="$2"
 
   if command -v curl &>/dev/null; then
-    curl -fsSL "${url}"
+    curl -fsSL "${url}" -o "${output}"
   elif command -v wget &>/dev/null; then
-    wget -qO- "${url}"
+    wget -qO "${output}" "${url}"
   else
     return 127
+  fi
+}
+
+run_verified_script() {
+  local context="$1"
+  local url="$2"
+  local expected_sha256="$3"
+  local script_file
+  local exit_status
+
+  command -v sha256sum &>/dev/null \
+    || die "[${context}] 未找到 sha256sum，无法校验下载内容。"
+
+  script_file=$(mktemp)
+  if ! download_to_file "${url}" "${script_file}"; then
+    rm -f -- "${script_file}"
+    die "[${context}] 脚本下载失败。"
+  fi
+
+  if ! printf '%s  %s\n' "${expected_sha256}" "${script_file}" \
+    | sha256sum -c - &>/dev/null; then
+    rm -f -- "${script_file}"
+    die "[${context}] 脚本 SHA-256 校验失败，已拒绝执行。"
+  fi
+
+  if bash "${script_file}"; then
+    rm -f -- "${script_file}"
+  else
+    exit_status=$?
+    rm -f -- "${script_file}"
+    return "${exit_status}"
   fi
 }
 
@@ -130,16 +162,104 @@ swap_size_to_mb() {
   esac
 }
 
-set_sshd_option() {
-  local key="$1"
-  local value="$2"
-  local file="$3"
+validate_ssh_public_key() {
+  local public_key="$1"
+  local key_file
 
-  if grep -Eq "^[#[:space:]]*${key}[[:space:]]+" "${file}"; then
-    sed -i -E "s|^[#[:space:]]*${key}[[:space:]]+.*|${key} ${value}|" "${file}"
-  else
-    printf '%s %s\n' "${key}" "${value}" >> "${file}"
+  command -v ssh-keygen &>/dev/null \
+    || die "[SSH] 未找到 ssh-keygen，无法校验 SSH 公钥。"
+
+  key_file=$(mktemp)
+  printf '%s\n' "${public_key}" > "${key_file}"
+
+  if ! ssh-keygen -l -f "${key_file}" &>/dev/null; then
+    rm -f -- "${key_file}"
+    die "[SSH] 公钥格式无效，请检查是否粘贴完整。"
   fi
+
+  rm -f -- "${key_file}"
+}
+
+write_sshd_managed_config() {
+  local file="$1"
+  local requested_port="$2"
+  local previous_managed_port=""
+  local temp_file
+
+  previous_managed_port=$(awk '
+    $0 == "# BEGIN init-linux managed SSH settings" { managed = 1; next }
+    $0 == "# END init-linux managed SSH settings" { managed = 0; next }
+    managed && $1 == "Port" { print $2; exit }
+  ' "${file}")
+
+  temp_file=$(mktemp "${file}.init-linux.XXXXXX")
+  {
+    echo "# BEGIN init-linux managed SSH settings"
+    if [[ -n "${requested_port}" ]]; then
+      printf 'Port %s\n' "${requested_port}"
+    elif [[ -n "${previous_managed_port}" ]]; then
+      printf 'Port %s\n' "${previous_managed_port}"
+    fi
+    echo "PermitRootLogin prohibit-password"
+    echo "PubkeyAuthentication yes"
+    echo "AuthorizedKeysFile .ssh/authorized_keys"
+    echo "AuthenticationMethods publickey"
+    echo "PasswordAuthentication no"
+    echo "KbdInteractiveAuthentication no"
+    echo "# END init-linux managed SSH settings"
+    echo
+    awk '
+      $0 == "# BEGIN init-linux managed SSH settings" { skip = 1; next }
+      $0 == "# END init-linux managed SSH settings" { skip = 0; next }
+      !skip { print }
+    ' "${file}"
+  } > "${temp_file}"
+
+  chmod --reference="${file}" "${temp_file}"
+  chown --reference="${file}" "${temp_file}"
+  mv -f -- "${temp_file}" "${file}"
+}
+
+verify_sshd_effective_config() {
+  local host_name
+  local effective_config
+
+  host_name=$(hostname 2>/dev/null || echo localhost)
+  effective_config=$(sshd -T \
+    -C "user=root,host=${host_name},addr=127.0.0.1" 2>/dev/null) || return 1
+
+  grep -Eq '^permitrootlogin (prohibit-password|without-password)$' <<< "${effective_config}" \
+    && grep -Fxq 'pubkeyauthentication yes' <<< "${effective_config}" \
+    && grep -Fxq 'authorizedkeysfile .ssh/authorized_keys' <<< "${effective_config}" \
+    && grep -Fxq 'authenticationmethods publickey' <<< "${effective_config}" \
+    && grep -Fxq 'passwordauthentication no' <<< "${effective_config}" \
+    && grep -Fxq 'kbdinteractiveauthentication no' <<< "${effective_config}"
+}
+
+systemd_unit_is_loaded() {
+  local unit="$1"
+  local load_state
+
+  load_state=$(systemctl show -p LoadState --value "${unit}" 2>/dev/null || true)
+  [[ "${load_state}" == "loaded" ]]
+}
+
+restart_ssh_service() {
+  local unit service
+
+  for unit in ssh.service sshd.service; do
+    if systemd_unit_is_loaded "${unit}"; then
+      service="${unit%.service}"
+      if systemctl restart "${service}"; then
+        ok "[SSH] 已执行 systemctl restart ${service}。"
+        return 0
+      fi
+
+      die "[SSH] systemctl restart ${service} 失败，请检查 SSH 服务状态。"
+    fi
+  done
+
+  warn "[SSH] 未找到 ssh/sshd systemd 服务，请手动重启 SSH 服务。"
 }
 
 should_run_step() {
@@ -272,18 +392,21 @@ if should_run_step "SWAP"; then
     info "[SWAP] 将按通用推荐创建 ${SWAP_SIZE} 的 /swapfile ..."
 
     if [[ -e /swapfile ]]; then
-      warn "[SWAP] 检测到 /swapfile 已存在，将尝试直接启用并写入开机挂载。"
+      warn "[SWAP] 检测到 /swapfile 已存在，将仅在确认其为有效 SWAP 文件后启用。"
+
+      [[ -f /swapfile && ! -L /swapfile ]] \
+        || die "[SWAP] /swapfile 不是普通文件或是符号链接，已拒绝操作。"
+
+      EXISTING_SWAP_TYPE=$(blkid -p -s TYPE -o value /swapfile 2>/dev/null || true)
+      [[ "${EXISTING_SWAP_TYPE}" == "swap" ]] \
+        || die "[SWAP] 现有 /swapfile 没有有效的 SWAP 签名，为避免损坏数据已停止。"
 
       if [[ "${DRY_RUN}" == "1" ]]; then
         echo "${YELLOW}[DRY_RUN]${RESET} chmod 600 /swapfile"
-        echo "${YELLOW}[DRY_RUN]${RESET} mkswap /swapfile"
         echo "${YELLOW}[DRY_RUN]${RESET} swapon /swapfile"
         echo "${YELLOW}[DRY_RUN]${RESET} grep -q '^/swapfile ' /etc/fstab || printf '/swapfile none swap sw 0 0\n' >> /etc/fstab"
       else
         chmod 600 /swapfile
-        if ! blkid /swapfile 2>/dev/null | grep -q 'TYPE="swap"'; then
-          mkswap /swapfile
-        fi
         swapon /swapfile
         grep -q '^/swapfile ' /etc/fstab || printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
         ok "[SWAP] 已启用现有 /swapfile。"
@@ -339,6 +462,7 @@ if should_run_step "SSH"; then
     if [[ -z "${SSH_PUBLIC_KEY}" ]]; then
       info "[SSH] 未输入公钥，已跳过 SSH 配置。"
     else
+      validate_ssh_public_key "${SSH_PUBLIC_KEY}"
       SSH_PORT=$(prompt_input "[SSH] 请输入 SSH 端口（直接回车保持当前配置不变）：")
 
       if [[ -n "${SSH_PORT}" ]]; then
@@ -349,12 +473,13 @@ if should_run_step "SSH"; then
       info "[SSH] 正在配置 root 用户的 SSH 公钥登录..."
 
       if [[ "${DRY_RUN}" == "1" ]]; then
-        echo "${YELLOW}[DRY_RUN]${RESET} install -m 700 -d /root/.ssh"
+        echo "${YELLOW}[DRY_RUN]${RESET} install -o root -g root -m 700 -d /root/.ssh"
         echo "${YELLOW}[DRY_RUN]${RESET} write public key to /root/.ssh/authorized_keys"
-        echo "${YELLOW}[DRY_RUN]${RESET} chmod 600 /root/.ssh/authorized_keys"
+        echo "${YELLOW}[DRY_RUN]${RESET} chown root:root and chmod 600 /root/.ssh/authorized_keys"
       else
-        install -m 700 -d /root/.ssh
+        install -o root -g root -m 700 -d /root/.ssh
         touch /root/.ssh/authorized_keys
+        chown root:root /root/.ssh/authorized_keys
         chmod 600 /root/.ssh/authorized_keys
         if grep -Fxq -- "${SSH_PUBLIC_KEY}" /root/.ssh/authorized_keys; then
           ok "[SSH] 公钥已存在于 /root/.ssh/authorized_keys，跳过重复写入。"
@@ -371,39 +496,37 @@ if should_run_step "SSH"; then
         info "[SSH] 正在更新 sshd_config ..."
 
         if [[ "${DRY_RUN}" == "1" ]]; then
-          echo "${YELLOW}[DRY_RUN]${RESET} cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak"
+          echo "${YELLOW}[DRY_RUN]${RESET} cp -a /etc/ssh/sshd_config /etc/ssh/sshd_config.bak"
           if [[ -n "${SSH_PORT}" ]]; then
-            echo "${YELLOW}[DRY_RUN]${RESET} set Port ${SSH_PORT}"
+            echo "${YELLOW}[DRY_RUN]${RESET} prepend managed Port ${SSH_PORT} before Include/Match directives"
           else
             echo "${YELLOW}[DRY_RUN]${RESET} keep current Port setting"
           fi
-          echo "${YELLOW}[DRY_RUN]${RESET} set PermitRootLogin prohibit-password"
-          echo "${YELLOW}[DRY_RUN]${RESET} set PubkeyAuthentication yes"
-          echo "${YELLOW}[DRY_RUN]${RESET} set PasswordAuthentication no"
-          echo "${YELLOW}[DRY_RUN]${RESET} sshd -t"
-          echo "${YELLOW}[DRY_RUN]${RESET} systemctl restart ssh"
+          echo "${YELLOW}[DRY_RUN]${RESET} prepend managed SSH authentication settings before Include/Match directives"
+          echo "${YELLOW}[DRY_RUN]${RESET} sshd -t and verify effective root settings with sshd -T"
+          echo "${YELLOW}[DRY_RUN]${RESET} systemctl restart ssh  # fallback: sshd"
         else
-          cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
-          if [[ -n "${SSH_PORT}" ]]; then
-            set_sshd_option "Port" "${SSH_PORT}" /etc/ssh/sshd_config
-          fi
-          set_sshd_option "PermitRootLogin" "prohibit-password" /etc/ssh/sshd_config
-          set_sshd_option "PubkeyAuthentication" "yes" /etc/ssh/sshd_config
-          set_sshd_option "PasswordAuthentication" "no" /etc/ssh/sshd_config
+          [[ -f /etc/ssh/sshd_config ]] \
+            || die "[SSH] 未找到 /etc/ssh/sshd_config。"
+          command -v sshd &>/dev/null \
+            || die "[SSH] 未找到 sshd，无法安全应用配置。"
 
-          if command -v sshd &>/dev/null; then
-            sshd -t || die "[SSH] sshd_config 校验失败，已保留备份：/etc/ssh/sshd_config.bak"
-          fi
+          cp -a /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+          write_sshd_managed_config /etc/ssh/sshd_config "${SSH_PORT}"
 
-          if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
-            systemctl restart ssh
-          elif systemctl list-unit-files 2>/dev/null | grep -q '^sshd\.service'; then
-            systemctl restart sshd
-          else
-            warn "[SSH] 未找到 ssh/sshd systemd 服务，请手动重启 SSH 服务。"
+          if ! sshd -t; then
+            cp -a /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
+            die "[SSH] sshd_config 语法校验失败，已自动恢复备份。"
           fi
 
-          ok "[SSH] SSH 配置已更新并尝试重启服务。"
+          if ! verify_sshd_effective_config; then
+            cp -a /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
+            die "[SSH] root 的 SSH 有效配置未达到预期，已自动恢复备份。"
+          fi
+
+          restart_ssh_service
+
+          ok "[SSH] SSH 配置已更新。"
         fi
 
         warn "[SSH] 请不要立即关闭当前连接。"
@@ -429,15 +552,19 @@ fi
 # ---------------------------------------------------------------------------
 if should_run_step "Docker"; then
   info "[Docker] 即将开始。"
-  info "[Docker] 正在调用远程安装脚本..."
-  DOCKER_INSTALL_URL="https://raw.githubusercontent.com/Unarmored7/install-docker/main/install-docker.sh"
+  info "[Docker] 正在下载并校验固定版本的安装脚本..."
+  DOCKER_INSTALL_COMMIT="49e13e6730a687cc2ee2a9c38a80922a0c019fa7"
+  DOCKER_INSTALL_SHA256="82fc70997526f41aef36306b4e1e1cb3f27b96610eb8afa7a49a66995cc55d6f"
+  DOCKER_INSTALL_URL="https://raw.githubusercontent.com/Unarmored7/install-docker/${DOCKER_INSTALL_COMMIT}/install-docker.sh"
 
   if [[ "${DRY_RUN}" == "1" ]]; then
     echo "${YELLOW}[DRY_RUN]${RESET} ensure curl/wget, install curl if both are missing"
-    echo "${YELLOW}[DRY_RUN]${RESET} curl -fsSL ${DOCKER_INSTALL_URL} | bash  # fallback: wget -qO-"
+    echo "${YELLOW}[DRY_RUN]${RESET} download ${DOCKER_INSTALL_URL} to a temporary file"
+    echo "${YELLOW}[DRY_RUN]${RESET} verify SHA-256 ${DOCKER_INSTALL_SHA256}"
+    echo "${YELLOW}[DRY_RUN]${RESET} execute the verified file, then remove it"
   else
     ensure_download_tool "Docker"
-    download_to_stdout "${DOCKER_INSTALL_URL}" | bash
+    run_verified_script "Docker" "${DOCKER_INSTALL_URL}" "${DOCKER_INSTALL_SHA256}"
   fi
 
   echo
