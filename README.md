@@ -16,7 +16,7 @@
 | **时间同步** | 设置时区为 `Asia/Shanghai`，安装并启用 `systemd-timesyncd` |
 | **SWAP** | 检查系统是否已有 SWAP，没有则自动按推荐大小创建 `/swapfile` |
 | **SSH** | 交互式写入 SSH 公钥，并可选关闭密码登录 |
-| **Docker** | 直接调用 `install-docker` 脚本安装 Docker |
+| **Docker** | 下载固定版本的 `install-docker` 脚本，校验 SHA-256 后安装 Docker |
 
 ---
 
@@ -117,6 +117,7 @@ apt upgrade -y
 - 检查当前系统是否已有 SWAP
 - 如果已有，则跳过创建并输出当前状态
 - 如果没有，则根据物理内存自动推荐 SWAP 大小
+- 如果 `/swapfile` 已存在，仅在确认其为普通、非符号链接且带有有效 SWAP 签名时启用
 - 自动创建 `/swapfile`
 - 写入 `/etc/fstab` 实现开机自动挂载
 
@@ -138,17 +139,22 @@ apt upgrade -y
 - 交互输入 SSH 公钥
 - 可选输入新 SSH 端口，直接回车则保持当前端口不变
 - 写入 `/root/.ssh/authorized_keys`
+- 写入前使用 `ssh-keygen` 校验公钥格式
 - 可选关闭密码登录并修改 `sshd_config`
 - 修改前自动备份配置
-- 尝试校验配置并重启 SSH 服务
+- 同时校验配置语法和 root 用户的有效配置
+- 校验通过后重启 SSH 服务；失败时自动恢复备份
 
 ### 5. Docker
 
-直接调用 `install-docker` 远程脚本。脚本会优先使用 `curl`，没有 `curl` 时回退到 `wget`，两者都不存在时先通过 `apt-get` 安装 `curl`：
+下载固定 Git 提交的 `install-docker` 脚本到临时文件，校验 SHA-256 后再执行，完成后删除临时文件。脚本会优先使用 `curl`，没有 `curl` 时回退到 `wget`，两者都不存在时先通过 `apt-get` 安装 `curl`。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Unarmored7/install-docker/main/install-docker.sh | bash
+DOCKER_INSTALL_COMMIT="49e13e6730a687cc2ee2a9c38a80922a0c019fa7"
+DOCKER_INSTALL_SHA256="82fc70997526f41aef36306b4e1e1cb3f27b96610eb8afa7a49a66995cc55d6f"
 ```
+
+升级 `install-docker` 版本时，需要同时更新提交号和对应的 SHA-256。
 
 ---
 
