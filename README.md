@@ -153,8 +153,8 @@ apt upgrade -y
 下载固定 Git 提交的 `install-docker` 脚本到临时文件，校验 SHA-256 后再执行，完成后删除临时文件。脚本会优先使用 `curl`，没有 `curl` 时回退到 `wget`，两者都不存在时先通过 `apt-get` 安装 `curl`。
 
 ```bash
-DOCKER_INSTALL_COMMIT="49e13e6730a687cc2ee2a9c38a80922a0c019fa7"
-DOCKER_INSTALL_SHA256="82fc70997526f41aef36306b4e1e1cb3f27b96610eb8afa7a49a66995cc55d6f"
+DOCKER_INSTALL_COMMIT="5db2723069df6fc576c73a05975d95f73e7acaca"
+DOCKER_INSTALL_SHA256="1ae0b4898ef1b6cf36a28a477e9600d2e1affebcb2c7bd312b1a5fb8e0619cd2"
 ```
 
 升级 `install-docker` 版本时，需要同时更新提交号和对应的 SHA-256。

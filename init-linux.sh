@@ -553,8 +553,8 @@ fi
 if should_run_step "Docker"; then
   info "[Docker] 即将开始。"
   info "[Docker] 正在下载并校验固定版本的安装脚本..."
-  DOCKER_INSTALL_COMMIT="49e13e6730a687cc2ee2a9c38a80922a0c019fa7"
-  DOCKER_INSTALL_SHA256="82fc70997526f41aef36306b4e1e1cb3f27b96610eb8afa7a49a66995cc55d6f"
+  DOCKER_INSTALL_COMMIT="5db2723069df6fc576c73a05975d95f73e7acaca"
+  DOCKER_INSTALL_SHA256="1ae0b4898ef1b6cf36a28a477e9600d2e1affebcb2c7bd312b1a5fb8e0619cd2"
   DOCKER_INSTALL_URL="https://raw.githubusercontent.com/Unarmored7/install-docker/${DOCKER_INSTALL_COMMIT}/install-docker.sh"
 
   if [[ "${DRY_RUN}" == "1" ]]; then
