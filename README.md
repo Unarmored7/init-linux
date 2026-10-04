@@ -146,7 +146,9 @@ apt upgrade -y
 - 通过 `sudo` 运行时，可选为 `$SUDO_USER` 同时写入该公钥
 - 可选关闭密码登录并修改 `sshd_config`（**对所有用户生效**），应用前会列出设置了密码但没有 `authorized_keys` 的用户
 - 不修改 `AuthorizedKeysFile`，但会确认 root 的有效配置仍会读取 `.ssh/authorized_keys`
-- 修改前自动备份配置
+- root 登录默认设为 `prohibit-password`；如果原配置已是 `no` 或 `forced-commands-only`，则保持不变
+- 指定新端口时，会注释掉 `sshd_config` 中其他 `Port` 行（`Port` 会累加监听）；`sshd_config.d/` 中的 `Port` 只提示不修改
+- 修改前自动备份配置到 `/etc/ssh/sshd_config.bak.<时间戳>`
 - 同时校验配置语法和 root 用户的有效配置
 - 校验通过后重启 SSH 服务；失败时自动恢复备份
 - 使用 `ssh.socket` 的系统（Ubuntu 22.10+）会执行 `systemctl daemon-reload` 并重启 `ssh.socket`，使新端口生效；修改端口后会检查新端口是否在监听

@@ -254,6 +254,7 @@ password_only_users() {
 write_sshd_managed_config() {
   local file="$1"
   local requested_port="$2"
+  local root_login="$3"
   local previous_managed_port=""
   local temp_file
 
@@ -271,17 +272,24 @@ write_sshd_managed_config() {
     elif [[ -n "${previous_managed_port}" ]]; then
       printf 'Port %s\n' "${previous_managed_port}"
     fi
-    echo "PermitRootLogin prohibit-password"
+    printf 'PermitRootLogin %s\n' "${root_login}"
     echo "PubkeyAuthentication yes"
     echo "AuthenticationMethods publickey"
     echo "PasswordAuthentication no"
     echo "KbdInteractiveAuthentication no"
     echo "# END init-linux managed SSH settings"
     echo
-    awk '
+    # Port 可以出现多次且会累加监听，指定新端口时注释掉文件中其他 Port 行，
+    # 否则旧端口（如 22）仍会继续监听。
+    awk -v disable_port="${requested_port:+1}" '
       $0 == "# BEGIN init-linux managed SSH settings" { skip = 1; next }
       $0 == "# END init-linux managed SSH settings" { skip = 0; next }
-      !skip { print }
+      skip { next }
+      disable_port && tolower($0) ~ /^[ \t]*port([ \t]|=)/ {
+        print "# " $0 "  # disabled by init-linux"
+        next
+      }
+      { print }
     ' "${file}"
   } > "${temp_file}"
 
@@ -290,24 +298,77 @@ write_sshd_managed_config() {
   mv -f -- "${temp_file}" "${file}"
 }
 
-verify_sshd_effective_config() {
+sshd_root_effective_config() {
+  local config_file="${1:-/etc/ssh/sshd_config}"
   local host_name
-  local effective_config
 
   host_name=$(hostname 2>/dev/null || echo localhost)
-  effective_config=$(sshd -T \
-    -C "user=root,host=${host_name},addr=127.0.0.1" 2>/dev/null) || return 1
+  sshd -T -f "${config_file}" \
+    -C "user=root,host=${host_name},addr=127.0.0.1" 2>/dev/null
+}
+
+# 当前已经比 prohibit-password 更严格（no / forced-commands-only）时保持不变，
+# 避免把已禁止的 root 登录重新放开。判断时去掉本脚本之前写入的托管配置块，
+# 否则重复运行时托管块会遮住管理员自己的设置。
+choose_root_login_policy() {
+  local current=""
+  local stripped_config
+
+  if command -v sshd &>/dev/null && [[ -r /etc/ssh/sshd_config ]]; then
+    stripped_config=$(mktemp)
+    awk '
+      $0 == "# BEGIN init-linux managed SSH settings" { skip = 1; next }
+      $0 == "# END init-linux managed SSH settings" { skip = 0; next }
+      !skip { print }
+    ' /etc/ssh/sshd_config > "${stripped_config}"
+    current=$(sshd_root_effective_config "${stripped_config}" \
+      | awk '$1 == "permitrootlogin" { print $2 }' || true)
+    rm -f -- "${stripped_config}"
+  fi
+
+  case "${current}" in
+    no|forced-commands-only) printf '%s' "${current}" ;;
+    *) printf 'prohibit-password' ;;
+  esac
+}
+
+verify_sshd_effective_config() {
+  local root_login="$1"
+  local root_login_pattern="${root_login}"
+  local effective_config
+
+  effective_config=$(sshd_root_effective_config) || return 1
 
   # 不覆盖 AuthorizedKeysFile，只确认 root 的有效配置仍会读取刚写入的公钥文件。
   grep -Eq '^authorizedkeysfile( .*)? (\.ssh/authorized_keys|%h/\.ssh/authorized_keys|/root/\.ssh/authorized_keys)( |$)' \
     <<< "${effective_config}" \
     || { err "[SSH] root 的 AuthorizedKeysFile 不包含 .ssh/authorized_keys，写入的公钥不会生效。"; return 1; }
 
-  grep -Eq '^permitrootlogin (prohibit-password|without-password)$' <<< "${effective_config}" \
+  if [[ "${root_login}" == "prohibit-password" ]]; then
+    root_login_pattern="(prohibit-password|without-password)"
+  fi
+
+  grep -Eq "^permitrootlogin ${root_login_pattern}\$" <<< "${effective_config}" \
     && grep -Fxq 'pubkeyauthentication yes' <<< "${effective_config}" \
     && grep -Fxq 'authenticationmethods publickey' <<< "${effective_config}" \
     && grep -Fxq 'passwordauthentication no' <<< "${effective_config}" \
     && grep -Fxq 'kbdinteractiveauthentication no' <<< "${effective_config}"
+}
+
+# sshd_config.d 等 Include 文件中的 Port 不会被本脚本修改，只做提示。
+warn_extra_ssh_ports() {
+  local requested_port="$1"
+  local port
+  local -a extra_ports=()
+
+  while read -r port; do
+    [[ "${port}" == "${requested_port}" ]] || extra_ports+=("${port}")
+  done < <(sshd_root_effective_config | awk '$1 == "port" { print $2 }' || true)
+
+  if (( ${#extra_ports[@]} > 0 )); then
+    warn "[SSH] 除 ${requested_port} 外，sshd 仍会监听端口：${extra_ports[*]}"
+    warn "[SSH] 这些 Port 来自 Include 的配置文件（如 /etc/ssh/sshd_config.d/），请按需手动移除。"
+  fi
 }
 
 systemd_unit_is_loaded() {
@@ -597,6 +658,12 @@ if should_run_step "SSH"; then
         warn "[SSH]   ${SSH_AT_RISK_USERS[*]}"
       fi
 
+      SSH_ROOT_LOGIN=$(choose_root_login_policy)
+      if [[ "${SSH_ROOT_LOGIN}" != "prohibit-password" ]]; then
+        warn "[SSH] 当前配置为 PermitRootLogin ${SSH_ROOT_LOGIN}，将保持不变，root 仍无法通过 SSH 公钥登录。"
+        warn "[SSH] 请确认已有其他用户可以通过公钥登录。"
+      fi
+
       SSH_CONFIRM=$(prompt_input "[SSH] 已写入公钥，准备关闭密码登录并应用 SSH 配置，是否继续？[y/N] ")
       if [[ ! "${SSH_CONFIRM}" =~ ^[Yy]$ ]]; then
         warn "[SSH] 已取消修改 sshd_config，仅保留公钥写入。"
@@ -604,13 +671,14 @@ if should_run_step "SSH"; then
         info "[SSH] 正在更新 sshd_config ..."
 
         if [[ "${DRY_RUN}" == "1" ]]; then
-          echo "${YELLOW}[DRY_RUN]${RESET} cp -a /etc/ssh/sshd_config /etc/ssh/sshd_config.bak"
+          echo "${YELLOW}[DRY_RUN]${RESET} cp -a /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.<时间戳>"
           if [[ -n "${SSH_PORT}" ]]; then
             echo "${YELLOW}[DRY_RUN]${RESET} prepend managed Port ${SSH_PORT} before Include/Match directives"
+            echo "${YELLOW}[DRY_RUN]${RESET} comment out other Port lines in /etc/ssh/sshd_config"
           else
             echo "${YELLOW}[DRY_RUN]${RESET} keep current Port setting"
           fi
-          echo "${YELLOW}[DRY_RUN]${RESET} prepend managed SSH authentication settings before Include/Match directives"
+          echo "${YELLOW}[DRY_RUN]${RESET} prepend managed SSH authentication settings (PermitRootLogin ${SSH_ROOT_LOGIN}) before Include/Match directives"
           echo "${YELLOW}[DRY_RUN]${RESET} sshd -t and verify effective root settings with sshd -T"
           echo "${YELLOW}[DRY_RUN]${RESET} systemctl daemon-reload && systemctl restart ssh.socket  # 若 ssh.socket 处于活动状态"
           echo "${YELLOW}[DRY_RUN]${RESET} systemctl restart ssh  # 否则，fallback: sshd"
@@ -620,21 +688,24 @@ if should_run_step "SSH"; then
           command -v sshd &>/dev/null \
             || die "[SSH] 未找到 sshd，无法安全应用配置。"
 
-          cp -a /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
-          write_sshd_managed_config /etc/ssh/sshd_config "${SSH_PORT}"
+          SSHD_BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
+          cp -a /etc/ssh/sshd_config "${SSHD_BACKUP}"
+          info "[SSH] 已备份原配置到 ${SSHD_BACKUP}"
+          write_sshd_managed_config /etc/ssh/sshd_config "${SSH_PORT}" "${SSH_ROOT_LOGIN}"
 
           if ! sshd -t; then
-            cp -a /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
+            cp -a "${SSHD_BACKUP}" /etc/ssh/sshd_config
             die "[SSH] sshd_config 语法校验失败，已自动恢复备份。"
           fi
 
-          if ! verify_sshd_effective_config; then
-            cp -a /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
+          if ! verify_sshd_effective_config "${SSH_ROOT_LOGIN}"; then
+            cp -a "${SSHD_BACKUP}" /etc/ssh/sshd_config
             die "[SSH] root 的 SSH 有效配置未达到预期，已自动恢复备份。"
           fi
 
           restart_ssh_service
           if [[ -n "${SSH_PORT}" ]]; then
+            warn_extra_ssh_ports "${SSH_PORT}"
             check_ssh_port_listening "${SSH_PORT}"
           fi
 
