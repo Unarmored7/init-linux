@@ -113,19 +113,41 @@ run_verified_script() {
   fi
 }
 
+# /dev/tty 在无控制终端时（cloud-init、cron、ssh 不带 -t）依然存在且权限可读，
+# 但打开会失败，所以必须实际尝试打开才能判断是否可交互。
+tty_available() {
+  { : </dev/tty; } 2>/dev/null
+}
+
+is_interactive() {
+  tty_available || [[ -t 0 ]]
+}
+
 prompt_input() {
   local prompt="$1"
-  local result
+  local result=""
 
-  if [[ -r /dev/tty ]]; then
-    read -r -p "${prompt}" result </dev/tty
+  if tty_available; then
+    read -r -p "${prompt}" result </dev/tty || true
   elif [[ -t 0 ]]; then
-    read -r -p "${prompt}" result
-  else
-    result=""
+    read -r -p "${prompt}" result || true
   fi
 
   printf '%s' "${result}"
+}
+
+installed_time_daemon() {
+  local pkg
+
+  for pkg in chrony ntpsec ntp openntpd; do
+    # shellcheck disable=SC2016  # ${Status} 是 dpkg-query 的格式字段
+    if [[ "$(dpkg-query -W -f='${Status}' "${pkg}" 2>/dev/null)" == "install ok installed" ]]; then
+      printf '%s' "${pkg}"
+      return 0
+    fi
+  done
+
+  return 1
 }
 
 recommended_swap_size() {
@@ -180,6 +202,55 @@ validate_ssh_public_key() {
   rm -f -- "${key_file}"
 }
 
+install_authorized_key() {
+  local user="$1"
+  local public_key="$2"
+  local home group ssh_dir keys_file
+
+  home=$(getent passwd "${user}" | cut -d: -f6)
+  [[ -n "${home}" && -d "${home}" ]] \
+    || die "[SSH] 无法确定用户 ${user} 的家目录。"
+  group=$(id -gn "${user}")
+  ssh_dir="${home}/.ssh"
+  keys_file="${ssh_dir}/authorized_keys"
+
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    echo "${YELLOW}[DRY_RUN]${RESET} install -o ${user} -g ${group} -m 700 -d ${ssh_dir}"
+    echo "${YELLOW}[DRY_RUN]${RESET} append public key to ${keys_file} (chmod 600)"
+    return 0
+  fi
+
+  install -o "${user}" -g "${group}" -m 700 -d "${ssh_dir}"
+  touch "${keys_file}"
+  chown "${user}:${group}" "${keys_file}"
+  chmod 600 "${keys_file}"
+  if grep -Fxq -- "${public_key}" "${keys_file}"; then
+    ok "[SSH] 公钥已存在于 ${keys_file}，跳过重复写入。"
+  else
+    printf '%s\n' "${public_key}" >> "${keys_file}"
+    ok "[SSH] 已写入公钥到 ${keys_file}。"
+  fi
+}
+
+# 列出关闭密码登录后可能无法登录的非 root 用户：
+# 有可登录 shell、设置了可用密码，但 ~/.ssh/authorized_keys 为空或不存在。
+password_only_users() {
+  local user hash home shell
+
+  [[ -r /etc/shadow ]] || return 0
+
+  while IFS=: read -r user hash _; do
+    [[ "${user}" != "root" ]] || continue
+    [[ -n "${hash}" && "${hash}" != [\!\*]* ]] || continue
+    IFS=: read -r _ _ _ _ _ home shell <<< "$(getent passwd "${user}")"
+    case "${shell}" in
+      ""|*/nologin|*/false) continue ;;
+    esac
+    [[ ! -s "${home}/.ssh/authorized_keys" ]] || continue
+    printf '%s\n' "${user}"
+  done < /etc/shadow
+}
+
 write_sshd_managed_config() {
   local file="$1"
   local requested_port="$2"
@@ -202,7 +273,6 @@ write_sshd_managed_config() {
     fi
     echo "PermitRootLogin prohibit-password"
     echo "PubkeyAuthentication yes"
-    echo "AuthorizedKeysFile .ssh/authorized_keys"
     echo "AuthenticationMethods publickey"
     echo "PasswordAuthentication no"
     echo "KbdInteractiveAuthentication no"
@@ -228,9 +298,13 @@ verify_sshd_effective_config() {
   effective_config=$(sshd -T \
     -C "user=root,host=${host_name},addr=127.0.0.1" 2>/dev/null) || return 1
 
+  # 不覆盖 AuthorizedKeysFile，只确认 root 的有效配置仍会读取刚写入的公钥文件。
+  grep -Eq '^authorizedkeysfile( .*)? (\.ssh/authorized_keys|%h/\.ssh/authorized_keys|/root/\.ssh/authorized_keys)( |$)' \
+    <<< "${effective_config}" \
+    || { err "[SSH] root 的 AuthorizedKeysFile 不包含 .ssh/authorized_keys，写入的公钥不会生效。"; return 1; }
+
   grep -Eq '^permitrootlogin (prohibit-password|without-password)$' <<< "${effective_config}" \
     && grep -Fxq 'pubkeyauthentication yes' <<< "${effective_config}" \
-    && grep -Fxq 'authorizedkeysfile .ssh/authorized_keys' <<< "${effective_config}" \
     && grep -Fxq 'authenticationmethods publickey' <<< "${effective_config}" \
     && grep -Fxq 'passwordauthentication no' <<< "${effective_config}" \
     && grep -Fxq 'kbdinteractiveauthentication no' <<< "${effective_config}"
@@ -247,6 +321,18 @@ systemd_unit_is_loaded() {
 restart_ssh_service() {
   local unit service
 
+  # Ubuntu 22.10+ 默认由 ssh.socket 监听端口，Port 由 systemd generator 从
+  # sshd_config 生成，必须 daemon-reload 并重启 socket，新端口才会生效。
+  # 重启 socket 会连带重启 ssh.service（KillMode=process，不影响已有会话）。
+  if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    systemctl daemon-reload \
+      || die "[SSH] systemctl daemon-reload 失败，请检查 systemd 状态。"
+    systemctl restart ssh.socket \
+      || die "[SSH] systemctl restart ssh.socket 失败，请检查 SSH 服务状态。"
+    ok "[SSH] 已执行 systemctl daemon-reload 和 systemctl restart ssh.socket。"
+    return 0
+  fi
+
   for unit in ssh.service sshd.service; do
     if systemd_unit_is_loaded "${unit}"; then
       service="${unit%.service}"
@@ -262,11 +348,23 @@ restart_ssh_service() {
   warn "[SSH] 未找到 ssh/sshd systemd 服务，请手动重启 SSH 服务。"
 }
 
+check_ssh_port_listening() {
+  local port="$1"
+
+  command -v ss &>/dev/null || return 0
+
+  if [[ -n "$(ss -Hltn "sport = :${port}" 2>/dev/null)" ]]; then
+    ok "[SSH] 已确认端口 ${port} 正在监听。"
+  else
+    warn "[SSH] 未检测到端口 ${port} 处于监听状态，请检查 SSH 服务后再断开当前连接。"
+  fi
+}
+
 should_run_step() {
   local name="$1"
   local answer
 
-  if [[ ! -r /dev/tty && ! -t 0 ]]; then
+  if ! is_interactive; then
     return 0
   fi
 
@@ -327,36 +425,46 @@ if should_run_step "时间同步"; then
   info "[时间同步] 正在设置时区为 Asia/Shanghai..."
   run timedatectl set-timezone Asia/Shanghai
 
-  info "[时间同步] 正在安装 systemd-timesyncd..."
-  run apt install -y systemd-timesyncd
+  TIME_DAEMON=$(installed_time_daemon || true)
 
-  info "[时间同步] 正在启用自动对时..."
-  run systemctl enable --now systemd-timesyncd
-
-  if [[ "${DRY_RUN}" == "1" ]]; then
-    echo "${YELLOW}[DRY_RUN]${RESET} timedatectl set-ntp true"
+  if [[ -n "${TIME_DAEMON}" ]]; then
+    # systemd-timesyncd 与 chrony/ntpsec 等互相冲突，安装它会卸载现有对时服务
+    # （云镜像常用 chrony 并配置了云厂商的时间源），因此保留现有服务。
+    ok "[时间同步] 检测到已安装 ${TIME_DAEMON}，保留现有对时服务，不安装 systemd-timesyncd。"
   else
-    if ! timedatectl set-ntp true; then
-      warn "当前环境不支持通过 timedatectl 直接设置 NTP，已尽量启用 systemd-timesyncd。"
+    info "[时间同步] 正在安装 systemd-timesyncd..."
+    run apt install -y systemd-timesyncd
+
+    info "[时间同步] 正在启用自动对时..."
+    run systemctl enable --now systemd-timesyncd
+
+    if [[ "${DRY_RUN}" == "1" ]]; then
+      echo "${YELLOW}[DRY_RUN]${RESET} timedatectl set-ntp true"
+    else
+      if ! timedatectl set-ntp true; then
+        warn "当前环境不支持通过 timedatectl 直接设置 NTP，已尽量启用 systemd-timesyncd。"
+      fi
+    fi
+
+    if [[ "${DRY_RUN}" != "1" ]]; then
+      TIMESYNCD_ENABLED=$(systemctl is-enabled systemd-timesyncd 2>/dev/null || true)
+      TIMESYNCD_ACTIVE=$(systemctl is-active systemd-timesyncd 2>/dev/null || true)
+
+      if [[ "${TIMESYNCD_ENABLED}" == "enabled" ]]; then
+        ok "[时间同步] systemd-timesyncd 已设置为开机自启。"
+      else
+        warn "[时间同步] systemd-timesyncd 未确认开机自启，当前状态：${TIMESYNCD_ENABLED:-unknown}"
+      fi
+
+      if [[ "${TIMESYNCD_ACTIVE}" == "active" ]]; then
+        ok "[时间同步] systemd-timesyncd 正在运行。"
+      else
+        warn "[时间同步] systemd-timesyncd 当前未处于运行状态：${TIMESYNCD_ACTIVE:-unknown}"
+      fi
     fi
   fi
 
   if [[ "${DRY_RUN}" != "1" ]]; then
-    TIMESYNCD_ENABLED=$(systemctl is-enabled systemd-timesyncd 2>/dev/null || true)
-    TIMESYNCD_ACTIVE=$(systemctl is-active systemd-timesyncd 2>/dev/null || true)
-
-    if [[ "${TIMESYNCD_ENABLED}" == "enabled" ]]; then
-      ok "[时间同步] systemd-timesyncd 已设置为开机自启。"
-    else
-      warn "[时间同步] systemd-timesyncd 未确认开机自启，当前状态：${TIMESYNCD_ENABLED:-unknown}"
-    fi
-
-    if [[ "${TIMESYNCD_ACTIVE}" == "active" ]]; then
-      ok "[时间同步] systemd-timesyncd 正在运行。"
-    else
-      warn "[时间同步] systemd-timesyncd 当前未处于运行状态：${TIMESYNCD_ACTIVE:-unknown}"
-    fi
-
     info "[时间同步] 当前时间配置："
     timedatectl
     date
@@ -453,7 +561,7 @@ fi
 if should_run_step "SSH"; then
   info "[SSH] 即将开始。"
 
-  if [[ ! -r /dev/tty && ! -t 0 ]]; then
+  if ! is_interactive; then
     warn "[SSH] 当前不是交互终端，已跳过 SSH 配置。"
   else
     echo
@@ -471,22 +579,22 @@ if should_run_step "SSH"; then
       fi
 
       info "[SSH] 正在配置 root 用户的 SSH 公钥登录..."
+      install_authorized_key root "${SSH_PUBLIC_KEY}"
 
-      if [[ "${DRY_RUN}" == "1" ]]; then
-        echo "${YELLOW}[DRY_RUN]${RESET} install -o root -g root -m 700 -d /root/.ssh"
-        echo "${YELLOW}[DRY_RUN]${RESET} write public key to /root/.ssh/authorized_keys"
-        echo "${YELLOW}[DRY_RUN]${RESET} chown root:root and chmod 600 /root/.ssh/authorized_keys"
-      else
-        install -o root -g root -m 700 -d /root/.ssh
-        touch /root/.ssh/authorized_keys
-        chown root:root /root/.ssh/authorized_keys
-        chmod 600 /root/.ssh/authorized_keys
-        if grep -Fxq -- "${SSH_PUBLIC_KEY}" /root/.ssh/authorized_keys; then
-          ok "[SSH] 公钥已存在于 /root/.ssh/authorized_keys，跳过重复写入。"
-        else
-          printf '%s\n' "${SSH_PUBLIC_KEY}" >> /root/.ssh/authorized_keys
-          ok "[SSH] 已写入公钥到 /root/.ssh/authorized_keys。"
+      if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] \
+        && getent passwd "${SUDO_USER}" &>/dev/null; then
+        SSH_SUDO_USER_KEY=$(prompt_input "[SSH] 检测到通过 sudo 运行（用户 ${SUDO_USER}），是否同时为该用户写入此公钥？[Y/n] ")
+        if [[ ! "${SSH_SUDO_USER_KEY}" =~ ^[Nn]$ ]]; then
+          install_authorized_key "${SUDO_USER}" "${SSH_PUBLIC_KEY}"
         fi
+      fi
+
+      echo
+      warn "[SSH] 接下来的配置对所有用户生效：关闭密码登录，仅允许公钥登录。"
+      mapfile -t SSH_AT_RISK_USERS < <(password_only_users)
+      if (( ${#SSH_AT_RISK_USERS[@]} > 0 )); then
+        warn "[SSH] 以下用户设置了密码但没有 ~/.ssh/authorized_keys，应用后将无法通过 SSH 登录："
+        warn "[SSH]   ${SSH_AT_RISK_USERS[*]}"
       fi
 
       SSH_CONFIRM=$(prompt_input "[SSH] 已写入公钥，准备关闭密码登录并应用 SSH 配置，是否继续？[y/N] ")
@@ -504,7 +612,8 @@ if should_run_step "SSH"; then
           fi
           echo "${YELLOW}[DRY_RUN]${RESET} prepend managed SSH authentication settings before Include/Match directives"
           echo "${YELLOW}[DRY_RUN]${RESET} sshd -t and verify effective root settings with sshd -T"
-          echo "${YELLOW}[DRY_RUN]${RESET} systemctl restart ssh  # fallback: sshd"
+          echo "${YELLOW}[DRY_RUN]${RESET} systemctl daemon-reload && systemctl restart ssh.socket  # 若 ssh.socket 处于活动状态"
+          echo "${YELLOW}[DRY_RUN]${RESET} systemctl restart ssh  # 否则，fallback: sshd"
         else
           [[ -f /etc/ssh/sshd_config ]] \
             || die "[SSH] 未找到 /etc/ssh/sshd_config。"
@@ -525,6 +634,9 @@ if should_run_step "SSH"; then
           fi
 
           restart_ssh_service
+          if [[ -n "${SSH_PORT}" ]]; then
+            check_ssh_port_listening "${SSH_PORT}"
+          fi
 
           ok "[SSH] SSH 配置已更新。"
         fi

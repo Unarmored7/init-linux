@@ -13,7 +13,7 @@
 | 功能 | 说明 |
 |------|------|
 | **系统更新** | 执行 `apt update` 和 `apt upgrade -y` |
-| **时间同步** | 设置时区为 `Asia/Shanghai`，安装并启用 `systemd-timesyncd` |
+| **时间同步** | 设置时区为 `Asia/Shanghai`，未安装其他对时服务时安装并启用 `systemd-timesyncd` |
 | **SWAP** | 检查系统是否已有 SWAP，没有则自动按推荐大小创建 `/swapfile` |
 | **SSH** | 交互式写入 SSH 公钥，并可选关闭密码登录 |
 | **Docker** | 下载固定版本的 `install-docker` 脚本，校验 SHA-256 后安装 Docker |
@@ -109,8 +109,8 @@ apt upgrade -y
 执行内容包括：
 
 - 设置时区为 `Asia/Shanghai`
-- 安装 `systemd-timesyncd`
-- 启用自动对时
+- 如果已安装 `chrony` / `ntpsec` / `ntp` / `openntpd`，保留现有对时服务（安装 `systemd-timesyncd` 会与它们冲突并将其卸载）
+- 否则安装 `systemd-timesyncd` 并启用自动对时
 - 输出 `timedatectl` 和 `date` 结果
 
 ### 3. SWAP
@@ -143,10 +143,14 @@ apt upgrade -y
 - 可选输入新 SSH 端口，直接回车则保持当前端口不变
 - 写入 `/root/.ssh/authorized_keys`
 - 写入前使用 `ssh-keygen` 校验公钥格式
-- 可选关闭密码登录并修改 `sshd_config`
+- 通过 `sudo` 运行时，可选为 `$SUDO_USER` 同时写入该公钥
+- 可选关闭密码登录并修改 `sshd_config`（**对所有用户生效**），应用前会列出设置了密码但没有 `authorized_keys` 的用户
+- 不修改 `AuthorizedKeysFile`，但会确认 root 的有效配置仍会读取 `.ssh/authorized_keys`
 - 修改前自动备份配置
 - 同时校验配置语法和 root 用户的有效配置
 - 校验通过后重启 SSH 服务；失败时自动恢复备份
+- 使用 `ssh.socket` 的系统（Ubuntu 22.10+）会执行 `systemctl daemon-reload` 并重启 `ssh.socket`，使新端口生效；修改端口后会检查新端口是否在监听
+- 非交互环境（如 cloud-init、cron、`ssh` 不带 `-t`）会自动跳过 SSH 配置
 
 ### 5. Docker
 
