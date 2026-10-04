@@ -284,15 +284,18 @@ validate_ssh_public_key() {
   rm -f -- "${key_file}"
 }
 
+# 调用方用 || 处理失败，此时 set -e 不生效，因此每一步都显式检查返回值。
 install_authorized_key() {
   local user="$1"
   local public_key="$2"
   local home group ssh_dir keys_file
 
   home=$(getent passwd "${user}" | cut -d: -f6)
-  [[ -n "${home}" && -d "${home}" ]] \
-    || die "[SSH] 无法确定用户 ${user} 的家目录。"
-  group=$(id -gn "${user}")
+  if [[ -z "${home}" || ! -d "${home}" ]]; then
+    err "[SSH] 无法确定用户 ${user} 的家目录。"
+    return 1
+  fi
+  group=$(id -gn "${user}") || return 1
   ssh_dir="${home}/.ssh"
   keys_file="${ssh_dir}/authorized_keys"
 
@@ -302,14 +305,14 @@ install_authorized_key() {
     return 0
   fi
 
-  install -o "${user}" -g "${group}" -m 700 -d "${ssh_dir}"
-  touch "${keys_file}"
-  chown "${user}:${group}" "${keys_file}"
-  chmod 600 "${keys_file}"
+  install -o "${user}" -g "${group}" -m 700 -d "${ssh_dir}" || return 1
+  touch "${keys_file}" || return 1
+  chown "${user}:${group}" "${keys_file}" || return 1
+  chmod 600 "${keys_file}" || return 1
   if grep -Fxq -- "${public_key}" "${keys_file}"; then
     ok "[SSH] 公钥已存在于 ${keys_file}，跳过重复写入。"
   else
-    printf '%s\n' "${public_key}" >> "${keys_file}"
+    printf '%s\n' "${public_key}" >> "${keys_file}" || return 1
     ok "[SSH] 已写入公钥到 ${keys_file}。"
   fi
 }
@@ -515,354 +518,399 @@ should_run_step() {
   [[ ! "${answer}" =~ ^[Nn]$ ]]
 }
 
-STEP_SYSTEM_UPDATE="未执行"
-STEP_TIME_SYNC="未执行"
-STEP_SWAP="未执行"
-STEP_SSH="未执行"
-STEP_DOCKER="未执行"
+print_summary() {
+  local title_level="$1"
+  local title="$2"
 
-# ---------------------------------------------------------------------------
-# 预检查
-# ---------------------------------------------------------------------------
-parse_args "$@"
-
-[[ -f /etc/os-release ]] || die "找不到 /etc/os-release，无法识别当前发行版。"
-# shellcheck source=/dev/null
-. /etc/os-release
-
-if [[ "${ID:-}" != "debian" && "${ID:-}" != "ubuntu" ]]; then
-  die "不支持当前发行版（ID=${ID:-unknown}），本脚本仅支持 Debian 和 Ubuntu。"
-fi
-
-if [[ "${EUID}" -ne 0 ]]; then
+  echo
+  echo "════════════════════════════════════════════════════════════════"
+  "${title_level}" "${title}"
+  echo "────────────────────────────────────────────────────────────────"
+  info "系统更新 : ${STEP_SYSTEM_UPDATE}"
+  info "时间同步 : ${STEP_TIME_SYNC}"
+  info "SWAP     : ${STEP_SWAP}"
+  info "SSH      : ${STEP_SSH}"
+  info "Docker   : ${STEP_DOCKER}"
   if [[ "${DRY_RUN}" == "1" ]]; then
-    warn "当前不是 root，DRY_RUN 预览中部分检测（如 sshd 有效配置、/etc/shadow）可能不完整。"
-  else
-    die "请以 root 身份运行此脚本，例如：sudo bash $0"
+    warn "当前为 DRY_RUN 模式，以上操作仅做了命令预览。"
   fi
-fi
+  echo "════════════════════════════════════════════════════════════════"
+}
 
-# ---------------------------------------------------------------------------
-# 功能：系统更新
-# ---------------------------------------------------------------------------
-if should_run_step "系统更新"; then
-  info "[系统更新] 即将开始。"
-  info "[系统更新] 正在更新软件源..."
-  run apt update
+# 异常退出时指出中断的步骤并输出总结。各步骤按顺序执行且结束时才更新状态，
+# 因此第一个仍为"未执行"的步骤就是中断所在的步骤。
+on_exit() {
+  local status=$?
+  local entry name var failed_step=""
 
-  info "[系统更新] 正在升级系统软件包..."
-  run env DEBIAN_FRONTEND=noninteractive apt upgrade -y \
-    -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold"
+  (( status != 0 )) || return 0
+  [[ "${STEPS_STARTED:-0}" == "1" ]] || return 0
 
-  echo
-  ok "[系统更新] 执行完成：软件源已更新，系统已升级。"
-  STEP_SYSTEM_UPDATE="已执行"
-else
-  warn "[系统更新] 已跳过。"
-  STEP_SYSTEM_UPDATE="已跳过"
-fi
+  for entry in "系统更新:STEP_SYSTEM_UPDATE" "时间同步:STEP_TIME_SYNC" \
+    "SWAP:STEP_SWAP" "SSH:STEP_SSH" "Docker:STEP_DOCKER"; do
+    name="${entry%%:*}"
+    var="${entry#*:}"
+    if [[ "${!var}" == "未执行" ]]; then
+      printf -v "${var}" '%s' "失败"
+      failed_step="${name}"
+      break
+    fi
+  done
 
-# ---------------------------------------------------------------------------
-# 功能：时间同步
-# ---------------------------------------------------------------------------
-if should_run_step "时间同步"; then
-  info "[时间同步] 即将开始。"
-  info "[时间同步] 正在设置时区为 Asia/Shanghai..."
-  run timedatectl set-timezone Asia/Shanghai
+  echo >&2
+  err "初始化在 [${failed_step:-未知}] 步骤中断（退出码 ${status}），后续步骤未执行。"
+  print_summary err "初始化未完成" >&2
+}
 
-  TIME_DAEMON=$(installed_time_daemon || true)
+# 整个流程放在 main 中：通过 curl | bash 运行时，bash 会先读完整个函数再执行，
+# 下载中断时不会执行被截断的脚本。
+main() {
+  STEPS_STARTED=0
+  STEP_SYSTEM_UPDATE="未执行"
+  STEP_TIME_SYNC="未执行"
+  STEP_SWAP="未执行"
+  STEP_SSH="未执行"
+  STEP_DOCKER="未执行"
+  trap on_exit EXIT
 
-  if [[ -n "${TIME_DAEMON}" ]]; then
-    # systemd-timesyncd 与 chrony/ntpsec 等互相冲突，安装它会卸载现有对时服务
-    # （云镜像常用 chrony 并配置了云厂商的时间源），因此保留现有服务。
-    ok "[时间同步] 检测到已安装 ${TIME_DAEMON}，保留现有对时服务，不安装 systemd-timesyncd。"
-  else
-    info "[时间同步] 正在安装 systemd-timesyncd..."
-    run apt install -y systemd-timesyncd
+  # ---------------------------------------------------------------------------
+  # 预检查
+  # ---------------------------------------------------------------------------
+  parse_args "$@"
 
-    info "[时间同步] 正在启用自动对时..."
-    run systemctl enable --now systemd-timesyncd
+  [[ -f /etc/os-release ]] || die "找不到 /etc/os-release，无法识别当前发行版。"
+  # shellcheck source=/dev/null
+  . /etc/os-release
 
+  if [[ "${ID:-}" != "debian" && "${ID:-}" != "ubuntu" ]]; then
+    die "不支持当前发行版（ID=${ID:-unknown}），本脚本仅支持 Debian 和 Ubuntu。"
+  fi
+
+  if [[ "${EUID}" -ne 0 ]]; then
     if [[ "${DRY_RUN}" == "1" ]]; then
-      echo "${YELLOW}[DRY_RUN]${RESET} timedatectl set-ntp true"
+      warn "当前不是 root，DRY_RUN 预览中部分检测（如 sshd 有效配置、/etc/shadow）可能不完整。"
     else
-      if ! timedatectl set-ntp true; then
-        warn "当前环境不支持通过 timedatectl 直接设置 NTP，已尽量启用 systemd-timesyncd。"
-      fi
-    fi
-
-    if [[ "${DRY_RUN}" != "1" ]]; then
-      TIMESYNCD_ENABLED=$(systemctl is-enabled systemd-timesyncd 2>/dev/null || true)
-      TIMESYNCD_ACTIVE=$(systemctl is-active systemd-timesyncd 2>/dev/null || true)
-
-      if [[ "${TIMESYNCD_ENABLED}" == "enabled" ]]; then
-        ok "[时间同步] systemd-timesyncd 已设置为开机自启。"
-      else
-        warn "[时间同步] systemd-timesyncd 未确认开机自启，当前状态：${TIMESYNCD_ENABLED:-unknown}"
-      fi
-
-      if [[ "${TIMESYNCD_ACTIVE}" == "active" ]]; then
-        ok "[时间同步] systemd-timesyncd 正在运行。"
-      else
-        warn "[时间同步] systemd-timesyncd 当前未处于运行状态：${TIMESYNCD_ACTIVE:-unknown}"
-      fi
+      die "请以 root 身份运行此脚本，例如：sudo bash $0"
     fi
   fi
 
-  if [[ "${DRY_RUN}" != "1" ]]; then
-    info "[时间同步] 当前时间配置："
-    timedatectl
-    date
-  fi
+  STEPS_STARTED=1
 
-  echo
-  ok "[时间同步] 执行完成：已设置时区，并已检查自动对时服务状态。"
-  STEP_TIME_SYNC="已执行"
-else
-  warn "[时间同步] 已跳过。"
-  STEP_TIME_SYNC="已跳过"
-fi
+  # ---------------------------------------------------------------------------
+  # 功能：系统更新
+  # ---------------------------------------------------------------------------
+  if should_run_step "系统更新"; then
+    info "[系统更新] 即将开始。"
+    info "[系统更新] 正在更新软件源..."
+    run apt update
 
-# ---------------------------------------------------------------------------
-# 功能：SWAP 检查与创建
-# ---------------------------------------------------------------------------
-if should_run_step "SWAP"; then
-  info "[SWAP] 即将开始。"
-  STEP_SWAP="已执行"
-  CURRENT_SWAP=$(swapon --show=NAME,SIZE --noheadings 2>/dev/null || true)
-  SWAP_CONTAINER=$(container_type || true)
+    info "[系统更新] 正在升级系统软件包..."
+    run env DEBIAN_FRONTEND=noninteractive apt upgrade -y \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confold"
 
-  if [[ -n "${CURRENT_SWAP}" ]]; then
-    ok "[SWAP] 检测到系统已存在 SWAP，跳过创建。"
-    if [[ "${DRY_RUN}" != "1" ]]; then
-      swapon --show
-      free -m
-    fi
-  elif [[ -n "${SWAP_CONTAINER}" ]]; then
-    warn "[SWAP] 检测到容器环境（${SWAP_CONTAINER}），容器内通常无法启用 SWAP，已跳过。"
-    STEP_SWAP="已跳过（容器环境）"
+    echo
+    ok "[系统更新] 执行完成：软件源已更新，系统已升级。"
+    STEP_SYSTEM_UPDATE="已执行"
   else
-    MEM_MB=$(awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo)
-    SWAP_SIZE=$(recommended_swap_size "${MEM_MB}")
-    SWAP_SIZE_MB=$(swap_size_to_mb "${SWAP_SIZE}")
+    warn "[系统更新] 已跳过。"
+    STEP_SYSTEM_UPDATE="已跳过"
+  fi
 
-    info "[SWAP] 未检测到 SWAP，当前物理内存约 ${MEM_MB} MB。"
+  # ---------------------------------------------------------------------------
+  # 功能：时间同步
+  # ---------------------------------------------------------------------------
+  if should_run_step "时间同步"; then
+    info "[时间同步] 即将开始。"
+    info "[时间同步] 正在设置时区为 Asia/Shanghai..."
+    run timedatectl set-timezone Asia/Shanghai
 
-    if [[ -e /swapfile ]]; then
-      warn "[SWAP] 检测到 /swapfile 已存在，将仅在确认其为有效 SWAP 文件后启用。"
-      EXISTING_SWAP_TYPE=$(blkid -p -s TYPE -o value /swapfile 2>/dev/null || true)
+    TIME_DAEMON=$(installed_time_daemon || true)
 
-      if [[ ! -f /swapfile || -L /swapfile ]]; then
-        warn "[SWAP] /swapfile 不是普通文件或是符号链接，已拒绝操作。"
-        STEP_SWAP="失败"
-      elif [[ "${EXISTING_SWAP_TYPE}" != "swap" ]]; then
-        warn "[SWAP] 现有 /swapfile 没有有效的 SWAP 签名，为避免损坏数据未做改动。"
-        STEP_SWAP="失败"
-      elif [[ "${DRY_RUN}" == "1" ]]; then
-        echo "${YELLOW}[DRY_RUN]${RESET} chmod 600 /swapfile"
-        echo "${YELLOW}[DRY_RUN]${RESET} swapon /swapfile"
-        echo "${YELLOW}[DRY_RUN]${RESET} add '/swapfile none swap sw 0 0' to /etc/fstab if missing"
-      elif chmod 600 /swapfile && swapon /swapfile; then
-        add_swap_fstab_entry
-        ok "[SWAP] 已启用现有 /swapfile。"
+    if [[ -n "${TIME_DAEMON}" ]]; then
+      # systemd-timesyncd 与 chrony/ntpsec 等互相冲突，安装它会卸载现有对时服务
+      # （云镜像常用 chrony 并配置了云厂商的时间源），因此保留现有服务。
+      ok "[时间同步] 检测到已安装 ${TIME_DAEMON}，保留现有对时服务，不安装 systemd-timesyncd。"
+    else
+      info "[时间同步] 正在安装 systemd-timesyncd..."
+      run apt install -y systemd-timesyncd
+
+      info "[时间同步] 正在启用自动对时..."
+      run systemctl enable --now systemd-timesyncd
+
+      if [[ "${DRY_RUN}" == "1" ]]; then
+        echo "${YELLOW}[DRY_RUN]${RESET} timedatectl set-ntp true"
+      else
+        if ! timedatectl set-ntp true; then
+          warn "当前环境不支持通过 timedatectl 直接设置 NTP，已尽量启用 systemd-timesyncd。"
+        fi
+      fi
+
+      if [[ "${DRY_RUN}" != "1" ]]; then
+        TIMESYNCD_ENABLED=$(systemctl is-enabled systemd-timesyncd 2>/dev/null || true)
+        TIMESYNCD_ACTIVE=$(systemctl is-active systemd-timesyncd 2>/dev/null || true)
+
+        if [[ "${TIMESYNCD_ENABLED}" == "enabled" ]]; then
+          ok "[时间同步] systemd-timesyncd 已设置为开机自启。"
+        else
+          warn "[时间同步] systemd-timesyncd 未确认开机自启，当前状态：${TIMESYNCD_ENABLED:-unknown}"
+        fi
+
+        if [[ "${TIMESYNCD_ACTIVE}" == "active" ]]; then
+          ok "[时间同步] systemd-timesyncd 正在运行。"
+        else
+          warn "[时间同步] systemd-timesyncd 当前未处于运行状态：${TIMESYNCD_ACTIVE:-unknown}"
+        fi
+      fi
+    fi
+
+    if [[ "${DRY_RUN}" != "1" ]]; then
+      info "[时间同步] 当前时间配置："
+      timedatectl
+      date
+    fi
+
+    echo
+    ok "[时间同步] 执行完成：已设置时区，并已检查自动对时服务状态。"
+    STEP_TIME_SYNC="已执行"
+  else
+    warn "[时间同步] 已跳过。"
+    STEP_TIME_SYNC="已跳过"
+  fi
+
+  # ---------------------------------------------------------------------------
+  # 功能：SWAP 检查与创建
+  # ---------------------------------------------------------------------------
+  if should_run_step "SWAP"; then
+    info "[SWAP] 即将开始。"
+    SWAP_RESULT="已执行"
+    CURRENT_SWAP=$(swapon --show=NAME,SIZE --noheadings 2>/dev/null || true)
+    SWAP_CONTAINER=$(container_type || true)
+
+    if [[ -n "${CURRENT_SWAP}" ]]; then
+      ok "[SWAP] 检测到系统已存在 SWAP，跳过创建。"
+      if [[ "${DRY_RUN}" != "1" ]]; then
         swapon --show
         free -m
-      else
-        warn "[SWAP] 启用现有 /swapfile 失败。"
-        STEP_SWAP="失败"
       fi
+    elif [[ -n "${SWAP_CONTAINER}" ]]; then
+      warn "[SWAP] 检测到容器环境（${SWAP_CONTAINER}），容器内通常无法启用 SWAP，已跳过。"
+      SWAP_RESULT="已跳过（容器环境）"
     else
-      SWAP_AVAIL_MB=$(df -Pm / | awk 'NR == 2 { print $4 }')
+      MEM_MB=$(awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo)
+      SWAP_SIZE=$(recommended_swap_size "${MEM_MB}")
+      SWAP_SIZE_MB=$(swap_size_to_mb "${SWAP_SIZE}")
 
-      if (( SWAP_AVAIL_MB < SWAP_SIZE_MB + SWAP_MIN_FREE_MB )); then
-        warn "[SWAP] 根分区可用空间约 ${SWAP_AVAIL_MB} MB，创建 ${SWAP_SIZE} SWAP 后剩余将不足 ${SWAP_MIN_FREE_MB} MB，已跳过。"
-        STEP_SWAP="已跳过（磁盘空间不足）"
-      elif [[ "${DRY_RUN}" == "1" ]]; then
-        info "[SWAP] 将按通用推荐创建 ${SWAP_SIZE} 的 /swapfile ..."
-        echo "${YELLOW}[DRY_RUN]${RESET} create /swapfile (chmod 600; chattr +C on btrfs)"
-        echo "${YELLOW}[DRY_RUN]${RESET} fallocate -l ${SWAP_SIZE} /swapfile  # 失败时改用 dd"
-        echo "${YELLOW}[DRY_RUN]${RESET} mkswap /swapfile && swapon /swapfile"
-        echo "${YELLOW}[DRY_RUN]${RESET} add '/swapfile none swap sw 0 0' to /etc/fstab if missing"
-      else
-        info "[SWAP] 将按通用推荐创建 ${SWAP_SIZE} 的 /swapfile ..."
-        if create_swapfile "${SWAP_SIZE}" "${SWAP_SIZE_MB}"; then
+      info "[SWAP] 未检测到 SWAP，当前物理内存约 ${MEM_MB} MB。"
+
+      if [[ -e /swapfile ]]; then
+        warn "[SWAP] 检测到 /swapfile 已存在，将仅在确认其为有效 SWAP 文件后启用。"
+        EXISTING_SWAP_TYPE=$(blkid -p -s TYPE -o value /swapfile 2>/dev/null || true)
+
+        if [[ ! -f /swapfile || -L /swapfile ]]; then
+          warn "[SWAP] /swapfile 不是普通文件或是符号链接，已拒绝操作。"
+          SWAP_RESULT="失败"
+        elif [[ "${EXISTING_SWAP_TYPE}" != "swap" ]]; then
+          warn "[SWAP] 现有 /swapfile 没有有效的 SWAP 签名，为避免损坏数据未做改动。"
+          SWAP_RESULT="失败"
+        elif [[ "${DRY_RUN}" == "1" ]]; then
+          echo "${YELLOW}[DRY_RUN]${RESET} chmod 600 /swapfile"
+          echo "${YELLOW}[DRY_RUN]${RESET} swapon /swapfile"
+          echo "${YELLOW}[DRY_RUN]${RESET} add '/swapfile none swap sw 0 0' to /etc/fstab if missing"
+        elif chmod 600 /swapfile && swapon /swapfile; then
           add_swap_fstab_entry
-          ok "[SWAP] 已创建并启用 ${SWAP_SIZE} 的 /swapfile。"
+          ok "[SWAP] 已启用现有 /swapfile。"
           swapon --show
           free -m
         else
-          rm -f -- /swapfile
-          warn "[SWAP] 创建或启用 /swapfile 失败，已删除未完成的文件，继续执行后续步骤。"
-          STEP_SWAP="失败"
+          warn "[SWAP] 启用现有 /swapfile 失败。"
+          SWAP_RESULT="失败"
         fi
-      fi
-    fi
-  fi
-
-  echo
-  if [[ "${STEP_SWAP}" == "已执行" ]]; then
-    ok "[SWAP] 执行完成。"
-  else
-    warn "[SWAP] 结束：${STEP_SWAP}。"
-  fi
-else
-  warn "[SWAP] 已跳过。"
-  STEP_SWAP="已跳过"
-fi
-
-# ---------------------------------------------------------------------------
-# 功能：SSH 公钥登录配置
-# ---------------------------------------------------------------------------
-if should_run_step "SSH"; then
-  info "[SSH] 即将开始。"
-
-  if ! is_interactive; then
-    warn "[SSH] 当前不是交互终端，已跳过 SSH 配置。"
-  else
-    echo
-    SSH_PUBLIC_KEY=$(prompt_input "[SSH] 请输入要写入的 SSH 公钥（直接回车跳过）：")
-
-    if [[ -z "${SSH_PUBLIC_KEY}" ]]; then
-      info "[SSH] 未输入公钥，已跳过 SSH 配置。"
-    else
-      validate_ssh_public_key "${SSH_PUBLIC_KEY}"
-      SSH_PORT=$(prompt_input "[SSH] 请输入 SSH 端口（直接回车保持当前配置不变）：")
-
-      if [[ -n "${SSH_PORT}" ]]; then
-        [[ "${SSH_PORT}" =~ ^[0-9]+$ ]] || die "[SSH] SSH 端口必须是数字。"
-        (( SSH_PORT >= 1 && SSH_PORT <= 65535 )) || die "[SSH] SSH 端口必须在 1-65535 之间。"
-      fi
-
-      info "[SSH] 正在配置 root 用户的 SSH 公钥登录..."
-      install_authorized_key root "${SSH_PUBLIC_KEY}"
-
-      if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] \
-        && getent passwd "${SUDO_USER}" &>/dev/null; then
-        SSH_SUDO_USER_KEY=$(prompt_input "[SSH] 检测到通过 sudo 运行（用户 ${SUDO_USER}），是否同时为该用户写入此公钥？[Y/n] ")
-        if [[ ! "${SSH_SUDO_USER_KEY}" =~ ^[Nn]$ ]]; then
-          install_authorized_key "${SUDO_USER}" "${SSH_PUBLIC_KEY}"
-        fi
-      fi
-
-      echo
-      warn "[SSH] 接下来的配置对所有用户生效：关闭密码登录，仅允许公钥登录。"
-      mapfile -t SSH_AT_RISK_USERS < <(password_only_users)
-      if (( ${#SSH_AT_RISK_USERS[@]} > 0 )); then
-        warn "[SSH] 以下用户设置了密码但没有 ~/.ssh/authorized_keys，应用后将无法通过 SSH 登录："
-        warn "[SSH]   ${SSH_AT_RISK_USERS[*]}"
-      fi
-
-      SSH_ROOT_LOGIN=$(choose_root_login_policy)
-      if [[ "${SSH_ROOT_LOGIN}" != "prohibit-password" ]]; then
-        warn "[SSH] 当前配置为 PermitRootLogin ${SSH_ROOT_LOGIN}，将保持不变，root 仍无法通过 SSH 公钥登录。"
-        warn "[SSH] 请确认已有其他用户可以通过公钥登录。"
-      fi
-
-      SSH_CONFIRM=$(prompt_input "[SSH] 已写入公钥，准备关闭密码登录并应用 SSH 配置，是否继续？[y/N] ")
-      if [[ ! "${SSH_CONFIRM}" =~ ^[Yy]$ ]]; then
-        warn "[SSH] 已取消修改 sshd_config，仅保留公钥写入。"
       else
-        info "[SSH] 正在更新 sshd_config ..."
+        SWAP_AVAIL_MB=$(df -Pm / | awk 'NR == 2 { print $4 }')
 
-        if [[ "${DRY_RUN}" == "1" ]]; then
-          echo "${YELLOW}[DRY_RUN]${RESET} cp -a /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.<时间戳>"
-          if [[ -n "${SSH_PORT}" ]]; then
-            echo "${YELLOW}[DRY_RUN]${RESET} prepend managed Port ${SSH_PORT} before Include/Match directives"
-            echo "${YELLOW}[DRY_RUN]${RESET} comment out other Port lines in /etc/ssh/sshd_config"
+        if (( SWAP_AVAIL_MB < SWAP_SIZE_MB + SWAP_MIN_FREE_MB )); then
+          warn "[SWAP] 根分区可用空间约 ${SWAP_AVAIL_MB} MB，创建 ${SWAP_SIZE} SWAP 后剩余将不足 ${SWAP_MIN_FREE_MB} MB，已跳过。"
+          SWAP_RESULT="已跳过（磁盘空间不足）"
+        elif [[ "${DRY_RUN}" == "1" ]]; then
+          info "[SWAP] 将按通用推荐创建 ${SWAP_SIZE} 的 /swapfile ..."
+          echo "${YELLOW}[DRY_RUN]${RESET} create /swapfile (chmod 600; chattr +C on btrfs)"
+          echo "${YELLOW}[DRY_RUN]${RESET} fallocate -l ${SWAP_SIZE} /swapfile  # 失败时改用 dd"
+          echo "${YELLOW}[DRY_RUN]${RESET} mkswap /swapfile && swapon /swapfile"
+          echo "${YELLOW}[DRY_RUN]${RESET} add '/swapfile none swap sw 0 0' to /etc/fstab if missing"
+        else
+          info "[SWAP] 将按通用推荐创建 ${SWAP_SIZE} 的 /swapfile ..."
+          if create_swapfile "${SWAP_SIZE}" "${SWAP_SIZE_MB}"; then
+            add_swap_fstab_entry
+            ok "[SWAP] 已创建并启用 ${SWAP_SIZE} 的 /swapfile。"
+            swapon --show
+            free -m
           else
-            echo "${YELLOW}[DRY_RUN]${RESET} keep current Port setting"
+            rm -f -- /swapfile
+            warn "[SWAP] 创建或启用 /swapfile 失败，已删除未完成的文件，继续执行后续步骤。"
+            SWAP_RESULT="失败"
           fi
-          echo "${YELLOW}[DRY_RUN]${RESET} prepend managed SSH authentication settings (PermitRootLogin ${SSH_ROOT_LOGIN}) before Include/Match directives"
-          echo "${YELLOW}[DRY_RUN]${RESET} sshd -t and verify effective root settings with sshd -T"
-          echo "${YELLOW}[DRY_RUN]${RESET} systemctl daemon-reload && systemctl restart ssh.socket  # 若 ssh.socket 处于活动状态"
-          echo "${YELLOW}[DRY_RUN]${RESET} systemctl restart ssh  # 否则，fallback: sshd"
-        else
-          [[ -f /etc/ssh/sshd_config ]] \
-            || die "[SSH] 未找到 /etc/ssh/sshd_config。"
-          command -v sshd &>/dev/null \
-            || die "[SSH] 未找到 sshd，无法安全应用配置。"
-
-          SSHD_BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
-          cp -a /etc/ssh/sshd_config "${SSHD_BACKUP}"
-          info "[SSH] 已备份原配置到 ${SSHD_BACKUP}"
-          write_sshd_managed_config /etc/ssh/sshd_config "${SSH_PORT}" "${SSH_ROOT_LOGIN}"
-
-          if ! sshd -t; then
-            cp -a "${SSHD_BACKUP}" /etc/ssh/sshd_config
-            die "[SSH] sshd_config 语法校验失败，已自动恢复备份。"
-          fi
-
-          if ! verify_sshd_effective_config "${SSH_ROOT_LOGIN}"; then
-            cp -a "${SSHD_BACKUP}" /etc/ssh/sshd_config
-            die "[SSH] root 的 SSH 有效配置未达到预期，已自动恢复备份。"
-          fi
-
-          restart_ssh_service
-          if [[ -n "${SSH_PORT}" ]]; then
-            warn_extra_ssh_ports "${SSH_PORT}"
-            check_ssh_port_listening "${SSH_PORT}"
-          fi
-
-          ok "[SSH] SSH 配置已更新。"
-        fi
-
-        warn "[SSH] 请不要立即关闭当前连接。"
-        if [[ -n "${SSH_PORT}" ]]; then
-          warn "[SSH] 请先使用新端口 ${SSH_PORT} 和公钥重新开一个终端测试登录。"
-        else
-          warn "[SSH] 请先使用当前端口和公钥重新开一个终端测试登录。"
         fi
       fi
     fi
-  fi
 
-  echo
-  ok "[SSH] 执行完成。"
-  STEP_SSH="已执行"
-else
-  warn "[SSH] 已跳过。"
-  STEP_SSH="已跳过"
-fi
-
-# ---------------------------------------------------------------------------
-# 功能：安装 Docker
-# ---------------------------------------------------------------------------
-if should_run_step "Docker"; then
-  info "[Docker] 即将开始。"
-  info "[Docker] 正在下载并校验固定版本的安装脚本..."
-  DOCKER_INSTALL_COMMIT="5db2723069df6fc576c73a05975d95f73e7acaca"
-  DOCKER_INSTALL_SHA256="1ae0b4898ef1b6cf36a28a477e9600d2e1affebcb2c7bd312b1a5fb8e0619cd2"
-  DOCKER_INSTALL_URL="https://raw.githubusercontent.com/Unarmored7/install-docker/${DOCKER_INSTALL_COMMIT}/install-docker.sh"
-
-  if [[ "${DRY_RUN}" == "1" ]]; then
-    echo "${YELLOW}[DRY_RUN]${RESET} ensure curl/wget, install curl if both are missing"
-    echo "${YELLOW}[DRY_RUN]${RESET} download ${DOCKER_INSTALL_URL} to a temporary file"
-    echo "${YELLOW}[DRY_RUN]${RESET} verify SHA-256 ${DOCKER_INSTALL_SHA256}"
-    echo "${YELLOW}[DRY_RUN]${RESET} execute the verified file, then remove it"
+    echo
+    if [[ "${SWAP_RESULT}" == "已执行" ]]; then
+      ok "[SWAP] 执行完成。"
+    else
+      warn "[SWAP] 结束：${SWAP_RESULT}。"
+    fi
+    STEP_SWAP="${SWAP_RESULT}"
   else
-    ensure_download_tool "Docker"
-    run_verified_script "Docker" "${DOCKER_INSTALL_URL}" "${DOCKER_INSTALL_SHA256}"
+    warn "[SWAP] 已跳过。"
+    STEP_SWAP="已跳过"
   fi
 
-  echo
-  ok "[Docker] 执行完成。"
-  STEP_DOCKER="已执行"
-else
-  warn "[Docker] 已跳过。"
-  STEP_DOCKER="已跳过"
-fi
+  # ---------------------------------------------------------------------------
+  # 功能：SSH 公钥登录配置
+  # ---------------------------------------------------------------------------
+  if should_run_step "SSH"; then
+    info "[SSH] 即将开始。"
 
-echo
-echo "════════════════════════════════════════════════════════════════"
-ok "初始化脚本执行结束"
-echo "────────────────────────────────────────────────────────────────"
-info "系统更新 : ${STEP_SYSTEM_UPDATE}"
-info "时间同步 : ${STEP_TIME_SYNC}"
-info "SWAP     : ${STEP_SWAP}"
-info "SSH      : ${STEP_SSH}"
-info "Docker   : ${STEP_DOCKER}"
-if [[ "${DRY_RUN}" == "1" ]]; then
-  warn "当前为 DRY_RUN 模式，以上操作仅做了命令预览。"
-fi
-echo "════════════════════════════════════════════════════════════════"
+    if ! is_interactive; then
+      warn "[SSH] 当前不是交互终端，已跳过 SSH 配置。"
+    else
+      echo
+      SSH_PUBLIC_KEY=$(prompt_input "[SSH] 请输入要写入的 SSH 公钥（直接回车跳过）：")
+
+      if [[ -z "${SSH_PUBLIC_KEY}" ]]; then
+        info "[SSH] 未输入公钥，已跳过 SSH 配置。"
+      else
+        validate_ssh_public_key "${SSH_PUBLIC_KEY}"
+        SSH_PORT=$(prompt_input "[SSH] 请输入 SSH 端口（直接回车保持当前配置不变）：")
+
+        if [[ -n "${SSH_PORT}" ]]; then
+          [[ "${SSH_PORT}" =~ ^[0-9]+$ ]] || die "[SSH] SSH 端口必须是数字。"
+          (( SSH_PORT >= 1 && SSH_PORT <= 65535 )) || die "[SSH] SSH 端口必须在 1-65535 之间。"
+        fi
+
+        info "[SSH] 正在配置 root 用户的 SSH 公钥登录..."
+        install_authorized_key root "${SSH_PUBLIC_KEY}" \
+          || die "[SSH] 为 root 写入公钥失败。"
+
+        if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] \
+          && getent passwd "${SUDO_USER}" &>/dev/null; then
+          SSH_SUDO_USER_KEY=$(prompt_input "[SSH] 检测到通过 sudo 运行（用户 ${SUDO_USER}），是否同时为该用户写入此公钥？[Y/n] ")
+          if [[ ! "${SSH_SUDO_USER_KEY}" =~ ^[Nn]$ ]]; then
+            install_authorized_key "${SUDO_USER}" "${SSH_PUBLIC_KEY}" \
+              || warn "[SSH] 未能为 ${SUDO_USER} 写入公钥，已跳过。"
+          fi
+        fi
+
+        echo
+        warn "[SSH] 接下来的配置对所有用户生效：关闭密码登录，仅允许公钥登录。"
+        mapfile -t SSH_AT_RISK_USERS < <(password_only_users)
+        if (( ${#SSH_AT_RISK_USERS[@]} > 0 )); then
+          warn "[SSH] 以下用户设置了密码但没有 ~/.ssh/authorized_keys，应用后将无法通过 SSH 登录："
+          warn "[SSH]   ${SSH_AT_RISK_USERS[*]}"
+        fi
+
+        SSH_ROOT_LOGIN=$(choose_root_login_policy)
+        if [[ "${SSH_ROOT_LOGIN}" != "prohibit-password" ]]; then
+          warn "[SSH] 当前配置为 PermitRootLogin ${SSH_ROOT_LOGIN}，将保持不变，root 仍无法通过 SSH 公钥登录。"
+          warn "[SSH] 请确认已有其他用户可以通过公钥登录。"
+        fi
+
+        SSH_CONFIRM=$(prompt_input "[SSH] 已写入公钥，准备关闭密码登录并应用 SSH 配置，是否继续？[y/N] ")
+        if [[ ! "${SSH_CONFIRM}" =~ ^[Yy]$ ]]; then
+          warn "[SSH] 已取消修改 sshd_config，仅保留公钥写入。"
+        else
+          info "[SSH] 正在更新 sshd_config ..."
+
+          if [[ "${DRY_RUN}" == "1" ]]; then
+            echo "${YELLOW}[DRY_RUN]${RESET} cp -a /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.<时间戳>"
+            if [[ -n "${SSH_PORT}" ]]; then
+              echo "${YELLOW}[DRY_RUN]${RESET} prepend managed Port ${SSH_PORT} before Include/Match directives"
+              echo "${YELLOW}[DRY_RUN]${RESET} comment out other Port lines in /etc/ssh/sshd_config"
+            else
+              echo "${YELLOW}[DRY_RUN]${RESET} keep current Port setting"
+            fi
+            echo "${YELLOW}[DRY_RUN]${RESET} prepend managed SSH authentication settings (PermitRootLogin ${SSH_ROOT_LOGIN}) before Include/Match directives"
+            echo "${YELLOW}[DRY_RUN]${RESET} sshd -t and verify effective root settings with sshd -T"
+            echo "${YELLOW}[DRY_RUN]${RESET} systemctl daemon-reload && systemctl restart ssh.socket  # 若 ssh.socket 处于活动状态"
+            echo "${YELLOW}[DRY_RUN]${RESET} systemctl restart ssh  # 否则，fallback: sshd"
+          else
+            [[ -f /etc/ssh/sshd_config ]] \
+              || die "[SSH] 未找到 /etc/ssh/sshd_config。"
+            command -v sshd &>/dev/null \
+              || die "[SSH] 未找到 sshd，无法安全应用配置。"
+
+            SSHD_BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
+            cp -a /etc/ssh/sshd_config "${SSHD_BACKUP}"
+            info "[SSH] 已备份原配置到 ${SSHD_BACKUP}"
+            write_sshd_managed_config /etc/ssh/sshd_config "${SSH_PORT}" "${SSH_ROOT_LOGIN}"
+
+            if ! sshd -t; then
+              cp -a "${SSHD_BACKUP}" /etc/ssh/sshd_config
+              die "[SSH] sshd_config 语法校验失败，已自动恢复备份。"
+            fi
+
+            if ! verify_sshd_effective_config "${SSH_ROOT_LOGIN}"; then
+              cp -a "${SSHD_BACKUP}" /etc/ssh/sshd_config
+              die "[SSH] root 的 SSH 有效配置未达到预期，已自动恢复备份。"
+            fi
+
+            restart_ssh_service
+            if [[ -n "${SSH_PORT}" ]]; then
+              warn_extra_ssh_ports "${SSH_PORT}"
+              check_ssh_port_listening "${SSH_PORT}"
+            fi
+
+            ok "[SSH] SSH 配置已更新。"
+          fi
+
+          warn "[SSH] 请不要立即关闭当前连接。"
+          if [[ -n "${SSH_PORT}" ]]; then
+            warn "[SSH] 请先使用新端口 ${SSH_PORT} 和公钥重新开一个终端测试登录。"
+          else
+            warn "[SSH] 请先使用当前端口和公钥重新开一个终端测试登录。"
+          fi
+        fi
+      fi
+    fi
+
+    echo
+    ok "[SSH] 执行完成。"
+    STEP_SSH="已执行"
+  else
+    warn "[SSH] 已跳过。"
+    STEP_SSH="已跳过"
+  fi
+
+  # ---------------------------------------------------------------------------
+  # 功能：安装 Docker
+  # ---------------------------------------------------------------------------
+  if should_run_step "Docker"; then
+    info "[Docker] 即将开始。"
+    info "[Docker] 正在下载并校验固定版本的安装脚本..."
+    DOCKER_INSTALL_COMMIT="5db2723069df6fc576c73a05975d95f73e7acaca"
+    DOCKER_INSTALL_SHA256="1ae0b4898ef1b6cf36a28a477e9600d2e1affebcb2c7bd312b1a5fb8e0619cd2"
+    DOCKER_INSTALL_URL="https://raw.githubusercontent.com/Unarmored7/install-docker/${DOCKER_INSTALL_COMMIT}/install-docker.sh"
+
+    if [[ "${DRY_RUN}" == "1" ]]; then
+      echo "${YELLOW}[DRY_RUN]${RESET} ensure curl/wget, install curl if both are missing"
+      echo "${YELLOW}[DRY_RUN]${RESET} download ${DOCKER_INSTALL_URL} to a temporary file"
+      echo "${YELLOW}[DRY_RUN]${RESET} verify SHA-256 ${DOCKER_INSTALL_SHA256}"
+      echo "${YELLOW}[DRY_RUN]${RESET} execute the verified file, then remove it"
+    else
+      ensure_download_tool "Docker"
+      run_verified_script "Docker" "${DOCKER_INSTALL_URL}" "${DOCKER_INSTALL_SHA256}"
+    fi
+
+    echo
+    ok "[Docker] 执行完成。"
+    STEP_DOCKER="已执行"
+  else
+    warn "[Docker] 已跳过。"
+    STEP_DOCKER="已跳过"
+  fi
+
+  print_summary ok "初始化脚本执行结束"
+}
+
+main "$@"
