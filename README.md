@@ -170,15 +170,24 @@ DOCKER_INSTALL_SHA256="1ae0b4898ef1b6cf36a28a477e9600d2e1affebcb2c7bd312b1a5fb8e
 
 ---
 
-## 环境变量
+## 预览模式（DRY_RUN）
+
+仅打印将要执行的命令，不真正执行。预览模式可以非 `root` 运行（部分检测可能不完整）。
+
+```bash
+bash init-linux.sh --dry-run
+
+# 通过管道运行时，用 bash -s -- 传递参数
+curl -fsSL https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | sudo bash -s -- --dry-run
+```
+
+也可以使用环境变量 `DRY_RUN=1`：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `DRY_RUN` | `0` | 设为 `1` 时仅打印将要执行的命令，不真正执行 |
+| `DRY_RUN` | `0` | 设为 `1` 时等同于 `--dry-run` |
 
-```bash
-DRY_RUN=1 bash init-linux.sh
-```
+> **Warning:** `sudo` 默认会清除环境变量，`DRY_RUN=1 sudo bash ...` 中的 `DRY_RUN` 不会生效，脚本会**真正执行**。请使用 `sudo DRY_RUN=1 bash ...` 或 `--dry-run`。
 
 ---
 

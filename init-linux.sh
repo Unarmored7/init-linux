@@ -12,11 +12,16 @@
 #   5. 安装 Docker
 #
 # 用法：
-#   bash init-linux.sh
-#   sudo bash init-linux.sh
+#   bash init-linux.sh [--dry-run]
+#   sudo bash init-linux.sh [--dry-run]
+#
+# 选项：
+#   -n, --dry-run   仅打印将要执行的命令，不真正执行（可以非 root 运行）。
+#   -h, --help      显示帮助。
 #
 # 环境变量：
-#   DRY_RUN=1   仅打印将要执行的命令，不真正执行。
+#   DRY_RUN=1   同 --dry-run。注意 sudo 默认会清除环境变量，
+#               请使用 sudo DRY_RUN=1 bash ... 或 --dry-run。
 
 set -euo pipefail
 
@@ -41,6 +46,30 @@ die()  { err "$@"; exit 1; }
 # DRY_RUN 包装器：当 DRY_RUN=1 时，仅打印命令而不执行。
 # ---------------------------------------------------------------------------
 DRY_RUN="${DRY_RUN:-0}"
+
+usage() {
+  cat <<'USAGE'
+用法：bash init-linux.sh [--dry-run]
+
+选项：
+  -n, --dry-run   仅打印将要执行的命令，不真正执行（可以非 root 运行）
+  -h, --help      显示帮助
+
+通过管道运行时传递参数：
+  curl -fsSL <url> | sudo bash -s -- --dry-run
+USAGE
+}
+
+parse_args() {
+  while (( $# > 0 )); do
+    case "$1" in
+      -n|--dry-run) DRY_RUN=1 ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; die "未知参数：$1" ;;
+    esac
+    shift
+  done
+}
 
 run() {
   if [[ "${DRY_RUN}" == "1" ]]; then
@@ -495,6 +524,8 @@ STEP_DOCKER="未执行"
 # ---------------------------------------------------------------------------
 # 预检查
 # ---------------------------------------------------------------------------
+parse_args "$@"
+
 [[ -f /etc/os-release ]] || die "找不到 /etc/os-release，无法识别当前发行版。"
 # shellcheck source=/dev/null
 . /etc/os-release
@@ -503,11 +534,12 @@ if [[ "${ID:-}" != "debian" && "${ID:-}" != "ubuntu" ]]; then
   die "不支持当前发行版（ID=${ID:-unknown}），本脚本仅支持 Debian 和 Ubuntu。"
 fi
 
-# ---------------------------------------------------------------------------
-# 功能：SSH 公钥登录配置
-# ---------------------------------------------------------------------------
 if [[ "${EUID}" -ne 0 ]]; then
-  die "请以 root 身份运行此脚本，例如：sudo bash $0"
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    warn "当前不是 root，DRY_RUN 预览中部分检测（如 sshd 有效配置、/etc/shadow）可能不完整。"
+  else
+    die "请以 root 身份运行此脚本，例如：sudo bash $0"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
