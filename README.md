@@ -13,7 +13,7 @@
 | 功能 | 说明 |
 |------|------|
 | **系统更新** | 执行 `apt update` 和 `apt upgrade -y` |
-| **时间同步** | 设置时区为 `Asia/Shanghai`，安装并启用 `systemd-timesyncd` |
+| **时间同步** | 设置时区为 `Asia/Shanghai`，未安装其他对时服务时安装并启用 `systemd-timesyncd` |
 | **SWAP** | 检查系统是否已有 SWAP，没有则自动按推荐大小创建 `/swapfile` |
 | **SSH** | 交互式写入 SSH 公钥，并可选关闭密码登录 |
 | **Docker** | 下载固定版本的 `install-docker` 脚本，校验 SHA-256 后安装 Docker |
@@ -109,8 +109,8 @@ apt upgrade -y
 执行内容包括：
 
 - 设置时区为 `Asia/Shanghai`
-- 安装 `systemd-timesyncd`
-- 启用自动对时
+- 如果已安装 `chrony` / `ntpsec` / `ntp` / `openntpd`，保留现有对时服务（安装 `systemd-timesyncd` 会与它们冲突并将其卸载）
+- 否则安装 `systemd-timesyncd` 并启用自动对时
 - 输出 `timedatectl` 和 `date` 结果
 
 ### 3. SWAP
@@ -120,8 +120,11 @@ apt upgrade -y
 - 检查当前系统是否已有 SWAP
 - 如果已有，则跳过创建并输出当前状态
 - 如果没有，则根据物理内存自动推荐 SWAP 大小
+- 在容器环境（LXC、OpenVZ、Docker 等）中跳过，容器内通常无法启用 SWAP
 - 如果 `/swapfile` 已存在，仅在确认其为普通、非符号链接且带有有效 SWAP 签名时启用
-- 自动创建 `/swapfile`
+- 创建前检查根分区空间，创建后剩余不足 1 GB 时跳过
+- 自动创建 `/swapfile`：优先使用 `fallocate`，失败时改用 `dd`；btrfs 上会先设置 `chattr +C`
+- 创建或启用失败时删除未完成的文件，并继续执行后续步骤
 - 写入 `/etc/fstab` 实现开机自动挂载
 
 默认采用通用推荐策略：
@@ -143,10 +146,16 @@ apt upgrade -y
 - 可选输入新 SSH 端口，直接回车则保持当前端口不变
 - 写入 `/root/.ssh/authorized_keys`
 - 写入前使用 `ssh-keygen` 校验公钥格式
-- 可选关闭密码登录并修改 `sshd_config`
-- 修改前自动备份配置
+- 通过 `sudo` 运行时，可选为 `$SUDO_USER` 同时写入该公钥
+- 可选关闭密码登录并修改 `sshd_config`（**对所有用户生效**），应用前会列出设置了密码但没有 `authorized_keys` 的用户
+- 不修改 `AuthorizedKeysFile`，但会确认 root 的有效配置仍会读取 `.ssh/authorized_keys`
+- root 登录默认设为 `prohibit-password`；如果原配置已是 `no` 或 `forced-commands-only`，则保持不变
+- 指定新端口时，会注释掉 `sshd_config` 中其他 `Port` 行（`Port` 会累加监听）；`sshd_config.d/` 中的 `Port` 只提示不修改
+- 修改前自动备份配置到 `/etc/ssh/sshd_config.bak.<时间戳>`
 - 同时校验配置语法和 root 用户的有效配置
 - 校验通过后重启 SSH 服务；失败时自动恢复备份
+- 使用 `ssh.socket` 的系统（Ubuntu 22.10+）会执行 `systemctl daemon-reload` 并重启 `ssh.socket`，使新端口生效；修改端口后会检查新端口是否在监听
+- 非交互环境（如 cloud-init、cron、`ssh` 不带 `-t`）会自动跳过 SSH 配置
 
 ### 5. Docker
 
@@ -161,15 +170,24 @@ DOCKER_INSTALL_SHA256="1ae0b4898ef1b6cf36a28a477e9600d2e1affebcb2c7bd312b1a5fb8e
 
 ---
 
-## 环境变量
+## 预览模式（DRY_RUN）
+
+仅打印将要执行的命令，不真正执行。预览模式可以非 `root` 运行（部分检测可能不完整）。
+
+```bash
+bash init-linux.sh --dry-run
+
+# 通过管道运行时，用 bash -s -- 传递参数
+curl -fsSL https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh | sudo bash -s -- --dry-run
+```
+
+也可以使用环境变量 `DRY_RUN=1`：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `DRY_RUN` | `0` | 设为 `1` 时仅打印将要执行的命令，不真正执行 |
+| `DRY_RUN` | `0` | 设为 `1` 时等同于 `--dry-run` |
 
-```bash
-DRY_RUN=1 bash init-linux.sh
-```
+> **Warning:** `sudo` 默认会清除环境变量，`DRY_RUN=1 sudo bash ...` 中的 `DRY_RUN` 不会生效，脚本会**真正执行**。请使用 `sudo DRY_RUN=1 bash ...` 或 `--dry-run`。
 
 ---
 
@@ -186,6 +204,10 @@ Docker   : 已跳过
 ```
 
 便于快速确认本次初始化做了哪些操作。
+
+如果脚本中途出错退出，也会指出中断所在的步骤（标记为 `失败`），并输出同样的总结。
+
+整个流程包在 `main` 函数中，通过 `curl | bash` 运行时，即使下载中途断开也不会执行被截断的脚本。
 
 ---
 
