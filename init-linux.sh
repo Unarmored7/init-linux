@@ -184,6 +184,59 @@ swap_size_to_mb() {
   esac
 }
 
+# 创建 /swapfile 前要求根分区至少保留的剩余空间（MB）。
+SWAP_MIN_FREE_MB=1024
+
+container_type() {
+  local virt
+
+  if command -v systemd-detect-virt &>/dev/null; then
+    virt=$(systemd-detect-virt --container 2>/dev/null) || return 1
+    printf '%s' "${virt}"
+    return 0
+  fi
+
+  if [[ -e /proc/user_beancounters && ! -e /proc/bc ]]; then
+    printf 'openvz'
+  elif [[ -e /.dockerenv || -e /run/.containerenv ]]; then
+    printf 'container'
+  else
+    return 1
+  fi
+}
+
+# 在 if 条件中调用时 set -e 不生效，因此每一步都显式检查返回值。
+create_swapfile() {
+  local size="$1"
+  local size_mb="$2"
+
+  : > /swapfile || return 1
+  chmod 600 /swapfile || return 1
+
+  # btrfs 上的 swapfile 必须是 NOCOW，且要在写入数据前设置。
+  if [[ "$(stat -f -c %T / 2>/dev/null)" == "btrfs" ]]; then
+    chattr +C /swapfile || return 1
+  fi
+
+  if ! { command -v fallocate &>/dev/null && fallocate -l "${size}" /swapfile; }; then
+    warn "[SWAP] fallocate 不可用或失败，改用 dd 创建 /swapfile，速度可能较慢。"
+    dd if=/dev/zero of=/swapfile bs=1M count="${size_mb}" status=progress || return 1
+  fi
+
+  mkswap /swapfile || return 1
+  swapon /swapfile
+}
+
+add_swap_fstab_entry() {
+  grep -Eq '^/swapfile[[:space:]]' /etc/fstab && return 0
+
+  # 末行缺少换行符时先补一个，避免新条目与末行拼接。
+  if [[ -s /etc/fstab && -n "$(tail -c 1 /etc/fstab)" ]]; then
+    echo >> /etc/fstab
+  fi
+  printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
+}
+
 validate_ssh_public_key() {
   local public_key="$1"
   local key_file
@@ -544,7 +597,9 @@ fi
 # ---------------------------------------------------------------------------
 if should_run_step "SWAP"; then
   info "[SWAP] 即将开始。"
+  STEP_SWAP="已执行"
   CURRENT_SWAP=$(swapon --show=NAME,SIZE --noheadings 2>/dev/null || true)
+  SWAP_CONTAINER=$(container_type || true)
 
   if [[ -n "${CURRENT_SWAP}" ]]; then
     ok "[SWAP] 检测到系统已存在 SWAP，跳过创建。"
@@ -552,65 +607,73 @@ if should_run_step "SWAP"; then
       swapon --show
       free -m
     fi
+  elif [[ -n "${SWAP_CONTAINER}" ]]; then
+    warn "[SWAP] 检测到容器环境（${SWAP_CONTAINER}），容器内通常无法启用 SWAP，已跳过。"
+    STEP_SWAP="已跳过（容器环境）"
   else
     MEM_MB=$(awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo)
     SWAP_SIZE=$(recommended_swap_size "${MEM_MB}")
     SWAP_SIZE_MB=$(swap_size_to_mb "${SWAP_SIZE}")
 
     info "[SWAP] 未检测到 SWAP，当前物理内存约 ${MEM_MB} MB。"
-    info "[SWAP] 将按通用推荐创建 ${SWAP_SIZE} 的 /swapfile ..."
 
     if [[ -e /swapfile ]]; then
       warn "[SWAP] 检测到 /swapfile 已存在，将仅在确认其为有效 SWAP 文件后启用。"
-
-      [[ -f /swapfile && ! -L /swapfile ]] \
-        || die "[SWAP] /swapfile 不是普通文件或是符号链接，已拒绝操作。"
-
       EXISTING_SWAP_TYPE=$(blkid -p -s TYPE -o value /swapfile 2>/dev/null || true)
-      [[ "${EXISTING_SWAP_TYPE}" == "swap" ]] \
-        || die "[SWAP] 现有 /swapfile 没有有效的 SWAP 签名，为避免损坏数据已停止。"
 
-      if [[ "${DRY_RUN}" == "1" ]]; then
+      if [[ ! -f /swapfile || -L /swapfile ]]; then
+        warn "[SWAP] /swapfile 不是普通文件或是符号链接，已拒绝操作。"
+        STEP_SWAP="失败"
+      elif [[ "${EXISTING_SWAP_TYPE}" != "swap" ]]; then
+        warn "[SWAP] 现有 /swapfile 没有有效的 SWAP 签名，为避免损坏数据未做改动。"
+        STEP_SWAP="失败"
+      elif [[ "${DRY_RUN}" == "1" ]]; then
         echo "${YELLOW}[DRY_RUN]${RESET} chmod 600 /swapfile"
         echo "${YELLOW}[DRY_RUN]${RESET} swapon /swapfile"
-        echo "${YELLOW}[DRY_RUN]${RESET} grep -q '^/swapfile ' /etc/fstab || printf '/swapfile none swap sw 0 0\n' >> /etc/fstab"
-      else
-        chmod 600 /swapfile
-        swapon /swapfile
-        grep -q '^/swapfile ' /etc/fstab || printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
+        echo "${YELLOW}[DRY_RUN]${RESET} add '/swapfile none swap sw 0 0' to /etc/fstab if missing"
+      elif chmod 600 /swapfile && swapon /swapfile; then
+        add_swap_fstab_entry
         ok "[SWAP] 已启用现有 /swapfile。"
         swapon --show
         free -m
+      else
+        warn "[SWAP] 启用现有 /swapfile 失败。"
+        STEP_SWAP="失败"
       fi
     else
-      if command -v fallocate &>/dev/null; then
-        run fallocate -l "${SWAP_SIZE}" /swapfile
+      SWAP_AVAIL_MB=$(df -Pm / | awk 'NR == 2 { print $4 }')
+
+      if (( SWAP_AVAIL_MB < SWAP_SIZE_MB + SWAP_MIN_FREE_MB )); then
+        warn "[SWAP] 根分区可用空间约 ${SWAP_AVAIL_MB} MB，创建 ${SWAP_SIZE} SWAP 后剩余将不足 ${SWAP_MIN_FREE_MB} MB，已跳过。"
+        STEP_SWAP="已跳过（磁盘空间不足）"
+      elif [[ "${DRY_RUN}" == "1" ]]; then
+        info "[SWAP] 将按通用推荐创建 ${SWAP_SIZE} 的 /swapfile ..."
+        echo "${YELLOW}[DRY_RUN]${RESET} create /swapfile (chmod 600; chattr +C on btrfs)"
+        echo "${YELLOW}[DRY_RUN]${RESET} fallocate -l ${SWAP_SIZE} /swapfile  # 失败时改用 dd"
+        echo "${YELLOW}[DRY_RUN]${RESET} mkswap /swapfile && swapon /swapfile"
+        echo "${YELLOW}[DRY_RUN]${RESET} add '/swapfile none swap sw 0 0' to /etc/fstab if missing"
       else
-        warn "[SWAP] 未找到 fallocate，改用 dd 创建 /swapfile，速度可能较慢。"
-        run dd if=/dev/zero of=/swapfile bs=1M count="${SWAP_SIZE_MB}" status=progress
-      fi
-
-      run chmod 600 /swapfile
-      run mkswap /swapfile
-      run swapon /swapfile
-
-      if [[ "${DRY_RUN}" == "1" ]]; then
-        echo "${YELLOW}[DRY_RUN]${RESET} grep -q '^/swapfile ' /etc/fstab || printf '/swapfile none swap sw 0 0\n' >> /etc/fstab"
-      else
-        grep -q '^/swapfile ' /etc/fstab || printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
-      fi
-
-      if [[ "${DRY_RUN}" != "1" ]]; then
-        ok "[SWAP] 已创建并启用 ${SWAP_SIZE} 的 /swapfile。"
-        swapon --show
-        free -m
+        info "[SWAP] 将按通用推荐创建 ${SWAP_SIZE} 的 /swapfile ..."
+        if create_swapfile "${SWAP_SIZE}" "${SWAP_SIZE_MB}"; then
+          add_swap_fstab_entry
+          ok "[SWAP] 已创建并启用 ${SWAP_SIZE} 的 /swapfile。"
+          swapon --show
+          free -m
+        else
+          rm -f -- /swapfile
+          warn "[SWAP] 创建或启用 /swapfile 失败，已删除未完成的文件，继续执行后续步骤。"
+          STEP_SWAP="失败"
+        fi
       fi
     fi
   fi
 
   echo
-  ok "[SWAP] 执行完成。"
-  STEP_SWAP="已执行"
+  if [[ "${STEP_SWAP}" == "已执行" ]]; then
+    ok "[SWAP] 执行完成。"
+  else
+    warn "[SWAP] 结束：${STEP_SWAP}。"
+  fi
 else
   warn "[SWAP] 已跳过。"
   STEP_SWAP="已跳过"
