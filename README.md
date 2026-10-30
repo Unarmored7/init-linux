@@ -132,7 +132,6 @@ apt upgrade -y
 | 物理内存 | 推荐 SWAP |
 |----------|-----------|
 | `<= 512M` | `1G` |
-| `<= 1G` | `2G` |
 | `<= 6G` | `2G` |
 | `<= 16G` | `4G` |
 | `<= 128G` | `8G` |
@@ -142,7 +141,7 @@ apt upgrade -y
 
 执行逻辑：
 
-- 交互输入 SSH 公钥
+- 交互输入 SSH 公钥，或通过环境变量 `SSH_PUBLIC_KEY` 预先提供（见下方[无人值守运行](#无人值守运行)）
 - 可选输入新 SSH 端口，直接回车则保持当前端口不变
 - 写入 `/root/.ssh/authorized_keys`
 - 写入前使用 `ssh-keygen` 校验公钥格式
@@ -155,7 +154,25 @@ apt upgrade -y
 - 同时校验配置语法和 root 用户的有效配置
 - 校验通过后重启 SSH 服务；失败时自动恢复备份
 - 使用 `ssh.socket` 的系统（Ubuntu 22.10+）会执行 `systemctl daemon-reload` 并重启 `ssh.socket`，使新端口生效；修改端口后会检查新端口是否在监听
-- 非交互环境（如 cloud-init、cron、`ssh` 不带 `-t`）会自动跳过 SSH 配置
+- 非交互环境（如 cloud-init、cron、`ssh` 不带 `-t`）未设置 `SSH_PUBLIC_KEY` 时会自动跳过 SSH 配置
+- 总结中会区分 `已执行`、`部分执行（仅写入公钥）`、`已跳过（未输入公钥）`、`已跳过（非交互终端）`
+
+#### 无人值守运行
+
+通过环境变量提供 SSH 配置，适用于 cloud-init 等没有交互终端的场景：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `SSH_PUBLIC_KEY` | 空 | 要写入的 SSH 公钥（单行）。设置后不再交互询问公钥和端口 |
+| `SSH_PORT` | 空 | 与 `SSH_PUBLIC_KEY` 一起使用，指定新的 SSH 端口；留空保持当前配置 |
+| `SSH_APPLY_CONFIG` | `0` | 设为 `1` 时跳过确认，直接关闭密码登录并应用 SSH 配置；否则非交互运行时只写入公钥 |
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Unarmored7/init-linux/main/init-linux.sh \
+  | sudo SSH_PUBLIC_KEY="ssh-ed25519 AAAA... user@host" SSH_PORT=2222 SSH_APPLY_CONFIG=1 bash
+```
+
+> **Warning:** 与 `DRY_RUN` 一样，变量要写在 `sudo` 之后，否则会被 `sudo` 清除。设置 `SSH_APPLY_CONFIG=1` 会关闭所有用户的密码登录，请确保公钥正确。
 
 ### 5. Docker
 
