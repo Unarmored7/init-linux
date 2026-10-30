@@ -22,6 +22,12 @@
 # 环境变量：
 #   DRY_RUN=1   同 --dry-run。注意 sudo 默认会清除环境变量，
 #               请使用 sudo DRY_RUN=1 bash ... 或 --dry-run。
+#   SSH_PUBLIC_KEY=<公钥>
+#               预先提供要写入的 SSH 公钥，不再交互询问，可用于无人值守运行。
+#   SSH_PORT=<端口>
+#               与 SSH_PUBLIC_KEY 一起使用，指定新的 SSH 端口；留空保持当前配置。
+#   SSH_APPLY_CONFIG=1
+#               跳过确认，直接关闭密码登录并应用 SSH 配置。
 
 set -euo pipefail
 
@@ -46,6 +52,9 @@ die()  { err "$@"; exit 1; }
 # DRY_RUN 包装器：当 DRY_RUN=1 时，仅打印命令而不执行。
 # ---------------------------------------------------------------------------
 DRY_RUN="${DRY_RUN:-0}"
+SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY:-}"
+SSH_PORT="${SSH_PORT:-}"
+SSH_APPLY_CONFIG="${SSH_APPLY_CONFIG:-0}"
 
 usage() {
   cat <<'USAGE'
@@ -54,6 +63,12 @@ usage() {
 选项：
   -n, --dry-run   仅打印将要执行的命令，不真正执行（可以非 root 运行）
   -h, --help      显示帮助
+
+环境变量：
+  DRY_RUN=1            同 --dry-run
+  SSH_PUBLIC_KEY=<公钥> 预先提供 SSH 公钥，不再交互询问
+  SSH_PORT=<端口>       与 SSH_PUBLIC_KEY 一起使用，指定新的 SSH 端口
+  SSH_APPLY_CONFIG=1   跳过确认，直接关闭密码登录并应用 SSH 配置
 
 通过管道运行时传递参数：
   curl -fsSL <url> | sudo bash -s -- --dry-run
@@ -184,14 +199,10 @@ recommended_swap_size() {
 
   if (( mem_mb <= 512 )); then
     echo "1G"
-  elif (( mem_mb <= 1024 )); then
-    echo "2G"
   elif (( mem_mb <= 6144 )); then
     echo "2G"
   elif (( mem_mb <= 16384 )); then
     echo "4G"
-  elif (( mem_mb <= 65536 )); then
-    echo "8G"
   elif (( mem_mb <= 131072 )); then
     echo "8G"
   else
@@ -269,6 +280,10 @@ add_swap_fstab_entry() {
 validate_ssh_public_key() {
   local public_key="$1"
   local key_file
+
+  # 通过 SSH_PUBLIC_KEY 传入时可能包含多行，ssh-keygen 只校验第一行。
+  [[ "${public_key}" != *$'\n'* ]] \
+    || die "[SSH] 一次只能写入一个公钥，请不要包含换行。"
 
   command -v ssh-keygen &>/dev/null \
     || die "[SSH] 未找到 ssh-keygen，无法校验 SSH 公钥。"
@@ -771,112 +786,138 @@ main() {
   # ---------------------------------------------------------------------------
   if should_run_step "SSH"; then
     info "[SSH] 即将开始。"
+    SSH_RESULT="已执行"
+    SSH_KEY_FROM_ENV=0
 
-    if ! is_interactive; then
-      warn "[SSH] 当前不是交互终端，已跳过 SSH 配置。"
-    else
+    if [[ -n "${SSH_PUBLIC_KEY}" ]]; then
+      SSH_KEY_FROM_ENV=1
+      info "[SSH] 使用环境变量 SSH_PUBLIC_KEY 提供的公钥。"
+    elif is_interactive; then
       echo
       SSH_PUBLIC_KEY=$(prompt_input "[SSH] 请输入要写入的 SSH 公钥（直接回车跳过）：")
+    fi
 
-      if [[ -z "${SSH_PUBLIC_KEY}" ]]; then
+    if [[ -z "${SSH_PUBLIC_KEY}" ]]; then
+      if is_interactive; then
         info "[SSH] 未输入公钥，已跳过 SSH 配置。"
+        SSH_RESULT="已跳过（未输入公钥）"
       else
-        validate_ssh_public_key "${SSH_PUBLIC_KEY}"
+        warn "[SSH] 当前不是交互终端且未设置 SSH_PUBLIC_KEY，已跳过 SSH 配置。"
+        SSH_RESULT="已跳过（非交互终端）"
+      fi
+    else
+      validate_ssh_public_key "${SSH_PUBLIC_KEY}"
+      # 公钥来自环境变量时，端口也只取环境变量 SSH_PORT，不再交互询问。
+      if (( SSH_KEY_FROM_ENV == 0 )); then
         SSH_PORT=$(prompt_input "[SSH] 请输入 SSH 端口（直接回车保持当前配置不变）：")
+      fi
 
-        if [[ -n "${SSH_PORT}" ]]; then
-          [[ "${SSH_PORT}" =~ ^[0-9]+$ ]] || die "[SSH] SSH 端口必须是数字。"
-          (( SSH_PORT >= 1 && SSH_PORT <= 65535 )) || die "[SSH] SSH 端口必须在 1-65535 之间。"
+      if [[ -n "${SSH_PORT}" ]]; then
+        [[ "${SSH_PORT}" =~ ^[0-9]+$ ]] || die "[SSH] SSH 端口必须是数字。"
+        (( SSH_PORT >= 1 && SSH_PORT <= 65535 )) || die "[SSH] SSH 端口必须在 1-65535 之间。"
+      fi
+
+      info "[SSH] 正在配置 root 用户的 SSH 公钥登录..."
+      install_authorized_key root "${SSH_PUBLIC_KEY}" \
+        || die "[SSH] 为 root 写入公钥失败。"
+
+      if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] \
+        && getent passwd "${SUDO_USER}" &>/dev/null; then
+        SSH_SUDO_USER_KEY=$(prompt_input "[SSH] 检测到通过 sudo 运行（用户 ${SUDO_USER}），是否同时为该用户写入此公钥？[Y/n] ")
+        if [[ ! "${SSH_SUDO_USER_KEY}" =~ ^[Nn]$ ]]; then
+          install_authorized_key "${SUDO_USER}" "${SSH_PUBLIC_KEY}" \
+            || warn "[SSH] 未能为 ${SUDO_USER} 写入公钥，已跳过。"
         fi
+      fi
 
-        info "[SSH] 正在配置 root 用户的 SSH 公钥登录..."
-        install_authorized_key root "${SSH_PUBLIC_KEY}" \
-          || die "[SSH] 为 root 写入公钥失败。"
+      echo
+      warn "[SSH] 接下来的配置对所有用户生效：关闭密码登录，仅允许公钥登录。"
+      mapfile -t SSH_AT_RISK_USERS < <(password_only_users)
+      if (( ${#SSH_AT_RISK_USERS[@]} > 0 )); then
+        warn "[SSH] 以下用户设置了密码但没有 ~/.ssh/authorized_keys，应用后将无法通过 SSH 登录："
+        warn "[SSH]   ${SSH_AT_RISK_USERS[*]}"
+      fi
 
-        if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] \
-          && getent passwd "${SUDO_USER}" &>/dev/null; then
-          SSH_SUDO_USER_KEY=$(prompt_input "[SSH] 检测到通过 sudo 运行（用户 ${SUDO_USER}），是否同时为该用户写入此公钥？[Y/n] ")
-          if [[ ! "${SSH_SUDO_USER_KEY}" =~ ^[Nn]$ ]]; then
-            install_authorized_key "${SUDO_USER}" "${SSH_PUBLIC_KEY}" \
-              || warn "[SSH] 未能为 ${SUDO_USER} 写入公钥，已跳过。"
-          fi
-        fi
+      SSH_ROOT_LOGIN=$(choose_root_login_policy)
+      if [[ "${SSH_ROOT_LOGIN}" != "prohibit-password" ]]; then
+        warn "[SSH] 当前配置为 PermitRootLogin ${SSH_ROOT_LOGIN}，将保持不变，root 仍无法通过 SSH 公钥登录。"
+        warn "[SSH] 请确认已有其他用户可以通过公钥登录。"
+      fi
 
-        echo
-        warn "[SSH] 接下来的配置对所有用户生效：关闭密码登录，仅允许公钥登录。"
-        mapfile -t SSH_AT_RISK_USERS < <(password_only_users)
-        if (( ${#SSH_AT_RISK_USERS[@]} > 0 )); then
-          warn "[SSH] 以下用户设置了密码但没有 ~/.ssh/authorized_keys，应用后将无法通过 SSH 登录："
-          warn "[SSH]   ${SSH_AT_RISK_USERS[*]}"
-        fi
-
-        SSH_ROOT_LOGIN=$(choose_root_login_policy)
-        if [[ "${SSH_ROOT_LOGIN}" != "prohibit-password" ]]; then
-          warn "[SSH] 当前配置为 PermitRootLogin ${SSH_ROOT_LOGIN}，将保持不变，root 仍无法通过 SSH 公钥登录。"
-          warn "[SSH] 请确认已有其他用户可以通过公钥登录。"
-        fi
-
+      if [[ "${SSH_APPLY_CONFIG}" == "1" ]]; then
+        info "[SSH] 已设置 SSH_APPLY_CONFIG=1，跳过确认，直接应用 SSH 配置。"
+        SSH_CONFIRM="y"
+      else
         SSH_CONFIRM=$(prompt_input "[SSH] 已写入公钥，准备关闭密码登录并应用 SSH 配置，是否继续？[y/N] ")
-        if [[ ! "${SSH_CONFIRM}" =~ ^[Yy]$ ]]; then
-          warn "[SSH] 已取消修改 sshd_config，仅保留公钥写入。"
-        else
-          info "[SSH] 正在更新 sshd_config ..."
+      fi
 
-          if [[ "${DRY_RUN}" == "1" ]]; then
-            echo "${YELLOW}[DRY_RUN]${RESET} cp -a /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.<时间戳>"
-            if [[ -n "${SSH_PORT}" ]]; then
-              echo "${YELLOW}[DRY_RUN]${RESET} prepend managed Port ${SSH_PORT} before Include/Match directives"
-              echo "${YELLOW}[DRY_RUN]${RESET} comment out other Port lines in /etc/ssh/sshd_config"
-            else
-              echo "${YELLOW}[DRY_RUN]${RESET} keep current Port setting"
-            fi
-            echo "${YELLOW}[DRY_RUN]${RESET} prepend managed SSH authentication settings (PermitRootLogin ${SSH_ROOT_LOGIN}) before Include/Match directives"
-            echo "${YELLOW}[DRY_RUN]${RESET} sshd -t and verify effective root settings with sshd -T"
-            echo "${YELLOW}[DRY_RUN]${RESET} systemctl daemon-reload && systemctl restart ssh.socket  # 若 ssh.socket 处于活动状态"
-            echo "${YELLOW}[DRY_RUN]${RESET} systemctl restart ssh  # 否则，fallback: sshd"
-          else
-            [[ -f /etc/ssh/sshd_config ]] \
-              || die "[SSH] 未找到 /etc/ssh/sshd_config。"
-            command -v sshd &>/dev/null \
-              || die "[SSH] 未找到 sshd，无法安全应用配置。"
+      if [[ ! "${SSH_CONFIRM}" =~ ^[Yy]$ ]]; then
+        warn "[SSH] 已取消修改 sshd_config，仅保留公钥写入。"
+        if ! is_interactive; then
+          warn "[SSH] 非交互运行时如需自动应用 SSH 配置，请设置 SSH_APPLY_CONFIG=1。"
+        fi
+        SSH_RESULT="部分执行（仅写入公钥）"
+      else
+        info "[SSH] 正在更新 sshd_config ..."
 
-            SSHD_BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
-            cp -a /etc/ssh/sshd_config "${SSHD_BACKUP}"
-            info "[SSH] 已备份原配置到 ${SSHD_BACKUP}"
-            write_sshd_managed_config /etc/ssh/sshd_config "${SSH_PORT}" "${SSH_ROOT_LOGIN}"
-
-            if ! sshd -t; then
-              cp -a "${SSHD_BACKUP}" /etc/ssh/sshd_config
-              die "[SSH] sshd_config 语法校验失败，已自动恢复备份。"
-            fi
-
-            if ! verify_sshd_effective_config "${SSH_ROOT_LOGIN}"; then
-              cp -a "${SSHD_BACKUP}" /etc/ssh/sshd_config
-              die "[SSH] root 的 SSH 有效配置未达到预期，已自动恢复备份。"
-            fi
-
-            restart_ssh_service
-            if [[ -n "${SSH_PORT}" ]]; then
-              warn_extra_ssh_ports "${SSH_PORT}"
-              check_ssh_port_listening "${SSH_PORT}"
-            fi
-
-            ok "[SSH] SSH 配置已更新。"
-          fi
-
-          warn "[SSH] 请不要立即关闭当前连接。"
+        if [[ "${DRY_RUN}" == "1" ]]; then
+          echo "${YELLOW}[DRY_RUN]${RESET} cp -a /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.<时间戳>"
           if [[ -n "${SSH_PORT}" ]]; then
-            warn "[SSH] 请先使用新端口 ${SSH_PORT} 和公钥重新开一个终端测试登录。"
+            echo "${YELLOW}[DRY_RUN]${RESET} prepend managed Port ${SSH_PORT} before Include/Match directives"
+            echo "${YELLOW}[DRY_RUN]${RESET} comment out other Port lines in /etc/ssh/sshd_config"
           else
-            warn "[SSH] 请先使用当前端口和公钥重新开一个终端测试登录。"
+            echo "${YELLOW}[DRY_RUN]${RESET} keep current Port setting"
           fi
+          echo "${YELLOW}[DRY_RUN]${RESET} prepend managed SSH authentication settings (PermitRootLogin ${SSH_ROOT_LOGIN}) before Include/Match directives"
+          echo "${YELLOW}[DRY_RUN]${RESET} sshd -t and verify effective root settings with sshd -T"
+          echo "${YELLOW}[DRY_RUN]${RESET} systemctl daemon-reload && systemctl restart ssh.socket  # 若 ssh.socket 处于活动状态"
+          echo "${YELLOW}[DRY_RUN]${RESET} systemctl restart ssh  # 否则，fallback: sshd"
+        else
+          [[ -f /etc/ssh/sshd_config ]] \
+            || die "[SSH] 未找到 /etc/ssh/sshd_config。"
+          command -v sshd &>/dev/null \
+            || die "[SSH] 未找到 sshd，无法安全应用配置。"
+
+          SSHD_BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
+          cp -a /etc/ssh/sshd_config "${SSHD_BACKUP}"
+          info "[SSH] 已备份原配置到 ${SSHD_BACKUP}"
+          write_sshd_managed_config /etc/ssh/sshd_config "${SSH_PORT}" "${SSH_ROOT_LOGIN}"
+
+          if ! sshd -t; then
+            cp -a "${SSHD_BACKUP}" /etc/ssh/sshd_config
+            die "[SSH] sshd_config 语法校验失败，已自动恢复备份。"
+          fi
+
+          if ! verify_sshd_effective_config "${SSH_ROOT_LOGIN}"; then
+            cp -a "${SSHD_BACKUP}" /etc/ssh/sshd_config
+            die "[SSH] root 的 SSH 有效配置未达到预期，已自动恢复备份。"
+          fi
+
+          restart_ssh_service
+          if [[ -n "${SSH_PORT}" ]]; then
+            warn_extra_ssh_ports "${SSH_PORT}"
+            check_ssh_port_listening "${SSH_PORT}"
+          fi
+
+          ok "[SSH] SSH 配置已更新。"
+        fi
+
+        warn "[SSH] 请不要立即关闭当前连接。"
+        if [[ -n "${SSH_PORT}" ]]; then
+          warn "[SSH] 请先使用新端口 ${SSH_PORT} 和公钥重新开一个终端测试登录。"
+        else
+          warn "[SSH] 请先使用当前端口和公钥重新开一个终端测试登录。"
         fi
       fi
     fi
 
     echo
-    ok "[SSH] 执行完成。"
-    STEP_SSH="已执行"
+    if [[ "${SSH_RESULT}" == "已执行" ]]; then
+      ok "[SSH] 执行完成。"
+    else
+      warn "[SSH] 结束：${SSH_RESULT}。"
+    fi
+    STEP_SSH="${SSH_RESULT}"
   else
     warn "[SSH] 已跳过。"
     STEP_SSH="已跳过"
